@@ -31,6 +31,9 @@ class LLMGateway:
     def __init__(self):
         self._cache: dict[str, str] = {}
         self._metrics: dict[str, list[dict]] = defaultdict(list)
+        # _dynamic_routing is set at runtime by the API's LLMConfigStore
+        # It maps TaskComplexity -> list[str] (model IDs as strings)
+        self._dynamic_routing: Optional[dict] = None
         self._configure_keys()
 
     def _configure_keys(self):
@@ -48,7 +51,18 @@ class LLMGateway:
             os.environ["OPENROUTER_API_BASE"] = settings.open_base_url
 
     def route_model(self, complexity: TaskComplexity) -> list[str]:
-        """Select the best available models for a given task complexity."""
+        """Select the best available models for a given task complexity.
+        
+        Checks _dynamic_routing first (set by API at runtime), then falls
+        back to the static MODEL_ROUTING config.
+        """
+        # Use dynamic routing if set by API
+        if self._dynamic_routing is not None:
+            tier_models = self._dynamic_routing.get(complexity, self._dynamic_routing.get(TaskComplexity.MEDIUM, []))
+            if tier_models:
+                return list(tier_models)
+
+        # Static config routing
         candidates = MODEL_ROUTING.get(complexity, MODEL_ROUTING[TaskComplexity.MEDIUM])
         available = [m.value for m in candidates if self._is_model_available(m)]
         if available:

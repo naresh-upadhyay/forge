@@ -39,6 +39,11 @@ const agentColors = {
   doc_writer: "#94a3b8",
 };
 
+const TIER_LABELS = { low: "Low", medium: "Medium", high: "High", critical: "Critical" };
+const TIER_COLORS = { low: "#22c55e", medium: "#3b82f6", high: "#f59e0b", critical: "#ef4444" };
+const PROVIDER_ICONS = { openrouter: "🔀", anthropic: "🧠", openai: "⚡", google: "🔮" };
+const PROVIDER_COLORS = { openrouter: "#7c3aed", anthropic: "#d97706", openai: "#059669", google: "#2563eb" };
+
 // ──────────────────────────────────────────────
 // API Client
 // ──────────────────────────────────────────────
@@ -104,8 +109,63 @@ const api = {
     return r.json();
   },
   async rebuildProject(id) {
-    const r = await fetch(`${API_URL}/api/projects/${id}/rebuild`, {
-      method: "POST"
+    const r = await fetch(`${API_URL}/api/projects/${id}/rebuild`, { method: "POST" });
+    return r.json();
+  },
+  // LLM Config
+  async getLLMProviders() {
+    const r = await fetch(`${API_URL}/api/llm/providers`);
+    return r.json();
+  },
+  async updateLLMProvider(providerId, data) {
+    const r = await fetch(`${API_URL}/api/llm/providers/${providerId}`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(data),
+    });
+    return r.json();
+  },
+  async getLLMModels() {
+    const r = await fetch(`${API_URL}/api/llm/models`);
+    return r.json();
+  },
+  async addLLMModel(data) {
+    const r = await fetch(`${API_URL}/api/llm/models`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(data),
+    });
+    return r.json();
+  },
+  async updateLLMModel(modelId, data) {
+    const r = await fetch(`${API_URL}/api/llm/models/${encodeURIComponent(modelId)}`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(data),
+    });
+    return r.json();
+  },
+  async deleteLLMModel(modelId) {
+    const r = await fetch(`${API_URL}/api/llm/models/${encodeURIComponent(modelId)}`, { method: "DELETE" });
+    return r.json();
+  },
+  async getLLMRouting() {
+    const r = await fetch(`${API_URL}/api/llm/routing`);
+    return r.json();
+  },
+  async updateLLMRouting(routing) {
+    const r = await fetch(`${API_URL}/api/llm/routing`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ routing }),
+    });
+    return r.json();
+  },
+  async testLLMModel(modelId) {
+    const r = await fetch(`${API_URL}/api/llm/test`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ model_id: modelId }),
     });
     return r.json();
   },
@@ -192,15 +252,18 @@ const Card = ({ children, style = {}, onClick }) => (
   </div>
 );
 
-const Button = ({ children, onClick, variant = "primary", disabled = false, style = {} }) => {
+const Button = ({ children, onClick, variant = "primary", disabled = false, style = {}, id }) => {
   const variants = {
     primary: { bg: theme.accent, color: "#fff", border: theme.accent },
     ghost: { bg: "transparent", color: theme.textMuted, border: theme.border },
     danger: { bg: theme.error, color: "#fff", border: theme.error },
+    success: { bg: theme.success, color: "#fff", border: theme.success },
+    warning: { bg: theme.warning, color: "#000", border: theme.warning },
   };
-  const v = variants[variant];
+  const v = variants[variant] || variants.primary;
   return (
     <button
+      id={id}
       onClick={onClick}
       disabled={disabled}
       style={{
@@ -218,6 +281,719 @@ const Button = ({ children, onClick, variant = "primary", disabled = false, styl
     >
       {children}
     </button>
+  );
+};
+
+const Input = ({ value, onChange, placeholder, type = "text", style = {} }) => (
+  <input
+    type={type}
+    value={value}
+    onChange={onChange}
+    placeholder={placeholder}
+    style={{
+      width: "100%",
+      padding: "10px 14px",
+      background: theme.bgInput,
+      border: `1px solid ${theme.border}`,
+      borderRadius: 8,
+      color: theme.text,
+      fontSize: 14,
+      outline: "none",
+      boxSizing: "border-box",
+      fontFamily: "inherit",
+      transition: "border-color 0.2s",
+      ...style,
+    }}
+    onFocus={(e) => (e.target.style.borderColor = theme.borderActive)}
+    onBlur={(e) => (e.target.style.borderColor = theme.border)}
+  />
+);
+
+const Label = ({ children }) => (
+  <div style={{ color: theme.textMuted, fontSize: 11, fontWeight: 600, letterSpacing: "0.5px", textTransform: "uppercase", marginBottom: 6 }}>
+    {children}
+  </div>
+);
+
+const Toast = ({ message, type = "success", onClose }) => {
+  useEffect(() => {
+    const t = setTimeout(onClose, 3000);
+    return () => clearTimeout(t);
+  }, [onClose]);
+  const colors = { success: theme.success, error: theme.error, info: theme.info };
+  return (
+    <div style={{
+      position: "fixed", bottom: 24, right: 24, zIndex: 9999,
+      background: theme.bgCard, border: `1px solid ${colors[type] || theme.border}`,
+      borderRadius: 10, padding: "12px 20px", color: colors[type] || theme.text,
+      fontSize: 13, fontWeight: 600, boxShadow: "0 4px 24px rgba(0,0,0,0.4)",
+      display: "flex", alignItems: "center", gap: 10, maxWidth: 360,
+    }}>
+      <span>{type === "success" ? "✓" : type === "error" ? "✗" : "ℹ"}</span>
+      <span>{message}</span>
+      <button onClick={onClose} style={{ background: "none", border: "none", color: theme.textMuted, cursor: "pointer", marginLeft: "auto", fontSize: 16 }}>×</button>
+    </div>
+  );
+};
+
+const SectionHeader = ({ title, subtitle, action }) => (
+  <div style={{ display: "flex", alignItems: "flex-end", justifyContent: "space-between", marginBottom: 16 }}>
+    <div>
+      <div style={{ fontSize: 16, fontWeight: 700, color: theme.text }}>{title}</div>
+      {subtitle && <div style={{ fontSize: 12, color: theme.textMuted, marginTop: 2 }}>{subtitle}</div>}
+    </div>
+    {action}
+  </div>
+);
+
+// ──────────────────────────────────────────────
+// LLM Settings Page
+// ──────────────────────────────────────────────
+
+const LLMSettingsPage = ({ onBack }) => {
+  const [tab, setTab] = useState("providers");
+  const [providers, setProviders] = useState([]);
+  const [models, setModels] = useState([]);
+  const [routing, setRouting] = useState({ low: [], medium: [], high: [], critical: [] });
+  const [loading, setLoading] = useState(true);
+  const [toast, setToast] = useState(null);
+  const [testResults, setTestResults] = useState({});
+  const [testingModel, setTestingModel] = useState(null);
+
+  // Provider edit state
+  const [editProvider, setEditProvider] = useState(null); // {id, api_key, base_url, enabled}
+
+  // Model add/edit state
+  const [showAddModel, setShowAddModel] = useState(false);
+  const [newModel, setNewModel] = useState({ model_id: "", name: "", provider: "openrouter", description: "", enabled: true });
+  const [editModel, setEditModel] = useState(null);
+
+  // Routing drag state
+  const [dragItem, setDragItem] = useState(null); // {tier, index}
+
+  const showToast = (message, type = "success") => setToast({ message, type });
+
+  const loadData = useCallback(async () => {
+    setLoading(true);
+    try {
+      const [provs, modls, route] = await Promise.all([
+        api.getLLMProviders(),
+        api.getLLMModels(),
+        api.getLLMRouting(),
+      ]);
+      setProviders(provs);
+      setModels(modls);
+      setRouting(route);
+    } catch (e) {
+      showToast("Failed to load LLM configuration", "error");
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => { loadData(); }, [loadData]);
+
+  // ── Provider Save ──
+  const handleSaveProvider = async () => {
+    if (!editProvider) return;
+    try {
+      const data = {};
+      if (editProvider.api_key) data.api_key = editProvider.api_key;
+      if (editProvider.base_url) data.base_url = editProvider.base_url;
+      if (editProvider.enabled !== undefined) data.enabled = editProvider.enabled;
+      await api.updateLLMProvider(editProvider.id, data);
+      setEditProvider(null);
+      showToast("Provider updated successfully");
+      loadData();
+    } catch (e) {
+      showToast("Failed to update provider", "error");
+    }
+  };
+
+  // ── Model Operations ──
+  const handleAddModel = async () => {
+    try {
+      await api.addLLMModel(newModel);
+      setShowAddModel(false);
+      setNewModel({ model_id: "", name: "", provider: "openrouter", description: "", enabled: true });
+      showToast("Model added successfully");
+      loadData();
+    } catch (e) {
+      showToast(e.message || "Failed to add model", "error");
+    }
+  };
+
+  const handleUpdateModel = async () => {
+    if (!editModel) return;
+    try {
+      await api.updateLLMModel(editModel.id, {
+        name: editModel.name,
+        enabled: editModel.enabled,
+        provider: editModel.provider,
+        description: editModel.description,
+      });
+      setEditModel(null);
+      showToast("Model updated");
+      loadData();
+    } catch (e) {
+      showToast("Failed to update model", "error");
+    }
+  };
+
+  const handleDeleteModel = async (modelId) => {
+    if (!confirm(`Delete model "${modelId}"?`)) return;
+    try {
+      await api.deleteLLMModel(modelId);
+      showToast("Model deleted");
+      loadData();
+    } catch (e) {
+      showToast("Failed to delete model", "error");
+    }
+  };
+
+  // ── Model Test ──
+  const handleTestModel = async (modelId) => {
+    setTestingModel(modelId);
+    try {
+      const result = await api.testLLMModel(modelId);
+      setTestResults(prev => ({ ...prev, [modelId]: result }));
+      showToast(result.success ? `✓ ${modelId} responded in ${result.elapsed_seconds}s` : `✗ ${modelId} failed`, result.success ? "success" : "error");
+    } catch (e) {
+      showToast("Test request failed", "error");
+    } finally {
+      setTestingModel(null);
+    }
+  };
+
+  // ── Routing ──
+  const moveModelInTier = (tier, fromIdx, toIdx) => {
+    setRouting(prev => {
+      const arr = [...(prev[tier] || [])];
+      const [item] = arr.splice(fromIdx, 1);
+      arr.splice(toIdx, 0, item);
+      return { ...prev, [tier]: arr };
+    });
+  };
+
+  const removeFromTier = (tier, idx) => {
+    setRouting(prev => {
+      const arr = [...(prev[tier] || [])];
+      arr.splice(idx, 1);
+      return { ...prev, [tier]: arr };
+    });
+  };
+
+  const addToTier = (tier, modelId) => {
+    if (!modelId) return;
+    setRouting(prev => {
+      const arr = prev[tier] || [];
+      if (arr.includes(modelId)) return prev;
+      return { ...prev, [tier]: [...arr, modelId] };
+    });
+  };
+
+  const handleSaveRouting = async () => {
+    try {
+      await api.updateLLMRouting(routing);
+      showToast("Routing configuration saved & applied");
+    } catch (e) {
+      showToast("Failed to save routing", "error");
+    }
+  };
+
+  const tabStyle = (id) => ({
+    padding: "10px 20px",
+    fontSize: 13,
+    fontWeight: 600,
+    background: "none",
+    border: "none",
+    borderBottom: `2px solid ${tab === id ? theme.accent : "transparent"}`,
+    color: tab === id ? theme.accent : theme.textMuted,
+    cursor: "pointer",
+    transition: "all 0.2s",
+    whiteSpace: "nowrap",
+  });
+
+  if (loading) return (
+    <div style={{ padding: 60, textAlign: "center", color: theme.textMuted }}>
+      <div style={{ fontSize: 24, marginBottom: 12 }}>⚙️</div>
+      Loading LLM configuration...
+    </div>
+  );
+
+  return (
+    <div style={{ maxWidth: 1040, margin: "0 auto", padding: "32px 20px" }}>
+      {toast && <Toast message={toast.message} type={toast.type} onClose={() => setToast(null)} />}
+
+      {/* Header */}
+      <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 32 }}>
+        <button onClick={onBack} style={{ background: "none", border: "none", color: theme.textMuted, cursor: "pointer", fontSize: 18 }}>←</button>
+        <div>
+          <h1 style={{ fontSize: 24, fontWeight: 700, color: theme.text, margin: 0 }}>
+            ⚙️ LLM Model Settings
+          </h1>
+          <p style={{ color: theme.textMuted, fontSize: 13, margin: "4px 0 0 0" }}>
+            Configure providers, models, and routing — changes apply immediately without restart
+          </p>
+        </div>
+      </div>
+
+      {/* Tabs */}
+      <div style={{ display: "flex", borderBottom: `1px solid ${theme.border}`, marginBottom: 28, gap: 0, overflowX: "auto" }}>
+        {[
+          { id: "providers", label: "🔑 Providers & Keys" },
+          { id: "models", label: "🤖 Models" },
+          { id: "routing", label: "🔀 Task Routing" },
+        ].map(t => (
+          <button key={t.id} onClick={() => setTab(t.id)} style={tabStyle(t.id)}>{t.label}</button>
+        ))}
+      </div>
+
+      {/* ── PROVIDERS TAB ── */}
+      {tab === "providers" && (
+        <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+          <SectionHeader
+            title="API Providers"
+            subtitle="Set your API keys and endpoint URLs for each provider. Keys are stored in memory only."
+          />
+          {providers.map(prov => (
+            <Card key={prov.id} style={{ padding: 0, overflow: "hidden" }}>
+              <div style={{ padding: "16px 20px", display: "flex", alignItems: "center", gap: 14 }}>
+                {/* Provider icon */}
+                <div style={{
+                  width: 44, height: 44, borderRadius: 10, flexShrink: 0,
+                  background: `${PROVIDER_COLORS[prov.id] || "#444"}22`,
+                  border: `1px solid ${PROVIDER_COLORS[prov.id] || "#444"}44`,
+                  display: "flex", alignItems: "center", justifyContent: "center", fontSize: 22,
+                }}>
+                  {PROVIDER_ICONS[prov.id] || "🔌"}
+                </div>
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <div style={{ fontSize: 15, fontWeight: 700, color: theme.text }}>{prov.name}</div>
+                  <div style={{ fontSize: 12, color: theme.textMuted, marginTop: 2, fontFamily: "monospace" }}>
+                    {prov.base_url}
+                  </div>
+                </div>
+                {/* Key status badge */}
+                <span style={{
+                  padding: "4px 12px", borderRadius: 20, fontSize: 11, fontWeight: 600,
+                  background: prov.has_key ? theme.successBg : theme.errorBg,
+                  color: prov.has_key ? theme.success : theme.error,
+                  border: `1px solid ${prov.has_key ? theme.success : theme.error}33`,
+                }}>
+                  {prov.has_key ? "✓ Key Set" : "No Key"}
+                </span>
+                {/* Enabled toggle */}
+                <div style={{
+                  padding: "4px 12px", borderRadius: 20, fontSize: 11, fontWeight: 600,
+                  background: prov.enabled ? theme.accentGlow : `${theme.textDim}22`,
+                  color: prov.enabled ? theme.accent : theme.textDim,
+                  border: `1px solid ${prov.enabled ? theme.accent : theme.textDim}33`,
+                }}>
+                  {prov.enabled ? "Enabled" : "Disabled"}
+                </div>
+                <Button variant="ghost" onClick={() => setEditProvider({ ...prov, api_key: "" })} style={{ padding: "6px 14px", fontSize: 12 }}>
+                  Edit
+                </Button>
+              </div>
+
+              {/* Collapsible key display */}
+              {prov.has_key && (
+                <div style={{ padding: "0 20px 14px 78px" }}>
+                  <div style={{ fontFamily: "monospace", fontSize: 12, color: theme.textDim, background: theme.bgInput, padding: "6px 12px", borderRadius: 6, display: "inline-block" }}>
+                    {prov.api_key_masked}
+                  </div>
+                </div>
+              )}
+            </Card>
+          ))}
+
+          {/* Edit Provider Modal */}
+          {editProvider && (
+            <div style={{
+              position: "fixed", inset: 0, background: "rgba(0,0,0,0.7)", zIndex: 1000,
+              display: "flex", alignItems: "center", justifyContent: "center", padding: 20,
+            }}>
+              <div style={{ background: theme.bgCard, border: `1px solid ${theme.border}`, borderRadius: 16, padding: 32, width: "100%", maxWidth: 520 }}>
+                <div style={{ fontSize: 18, fontWeight: 700, color: theme.text, marginBottom: 24 }}>
+                  {PROVIDER_ICONS[editProvider.id]} Edit {editProvider.name}
+                </div>
+                <div style={{ display: "flex", flexDirection: "column", gap: 18 }}>
+                  <div>
+                    <Label>API Key {editProvider.has_key && <span style={{ color: theme.textDim, fontWeight: 400 }}>(leave blank to keep existing)</span>}</Label>
+                    <Input
+                      type="password"
+                      value={editProvider.api_key}
+                      onChange={e => setEditProvider(p => ({ ...p, api_key: e.target.value }))}
+                      placeholder={editProvider.has_key ? "••••••••••••••••••••" : "sk-or-v1-..."}
+                    />
+                  </div>
+                  <div>
+                    <Label>Base URL / Endpoint</Label>
+                    <Input
+                      value={editProvider.base_url}
+                      onChange={e => setEditProvider(p => ({ ...p, base_url: e.target.value }))}
+                      placeholder="https://openrouter.ai/api/v1/"
+                    />
+                  </div>
+                  <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                    <label style={{ display: "flex", alignItems: "center", gap: 8, cursor: "pointer", color: theme.text, fontSize: 14 }}>
+                      <input
+                        type="checkbox"
+                        checked={editProvider.enabled}
+                        onChange={e => setEditProvider(p => ({ ...p, enabled: e.target.checked }))}
+                        style={{ width: 16, height: 16, accentColor: theme.accent }}
+                      />
+                      Enable this provider
+                    </label>
+                  </div>
+                </div>
+                <div style={{ display: "flex", gap: 10, marginTop: 28 }}>
+                  <Button variant="ghost" onClick={() => setEditProvider(null)} style={{ flex: 1 }}>Cancel</Button>
+                  <Button onClick={handleSaveProvider} style={{ flex: 2 }}>Save Changes</Button>
+                </div>
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* ── MODELS TAB ── */}
+      {tab === "models" && (
+        <div>
+          <SectionHeader
+            title="Available Models"
+            subtitle="Manage the models available to FORGE. You can add custom models or disable built-in ones."
+            action={
+              <Button id="add-model-btn" onClick={() => setShowAddModel(true)} style={{ padding: "7px 16px", fontSize: 12 }}>
+                + Add Custom Model
+              </Button>
+            }
+          />
+
+          {/* Add Model Panel */}
+          {showAddModel && (
+            <Card style={{ marginBottom: 20, border: `1px solid ${theme.accent}44`, background: `${theme.accentGlow}` }}>
+              <div style={{ fontSize: 14, fontWeight: 700, color: theme.text, marginBottom: 16 }}>➕ Add Custom Model</div>
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14 }}>
+                <div>
+                  <Label>Model ID (LiteLLM format)</Label>
+                  <Input value={newModel.model_id} onChange={e => setNewModel(p => ({ ...p, model_id: e.target.value }))} placeholder="openrouter/meta-llama/llama-3.3-70b-instruct:free" />
+                </div>
+                <div>
+                  <Label>Display Name</Label>
+                  <Input value={newModel.name} onChange={e => setNewModel(p => ({ ...p, name: e.target.value }))} placeholder="Llama 3.3 70B" />
+                </div>
+                <div>
+                  <Label>Provider</Label>
+                  <select value={newModel.provider} onChange={e => setNewModel(p => ({ ...p, provider: e.target.value }))}
+                    style={{ width: "100%", padding: "10px 14px", background: theme.bgInput, border: `1px solid ${theme.border}`, borderRadius: 8, color: theme.text, fontSize: 14, outline: "none" }}>
+                    <option value="openrouter">OpenRouter</option>
+                    <option value="anthropic">Anthropic</option>
+                    <option value="openai">OpenAI</option>
+                    <option value="google">Google</option>
+                  </select>
+                </div>
+                <div>
+                  <Label>Description (optional)</Label>
+                  <Input value={newModel.description} onChange={e => setNewModel(p => ({ ...p, description: e.target.value }))} placeholder="Fast, cost-effective..." />
+                </div>
+              </div>
+              <div style={{ display: "flex", gap: 10, marginTop: 16 }}>
+                <Button variant="ghost" onClick={() => setShowAddModel(false)}>Cancel</Button>
+                <Button onClick={handleAddModel} disabled={!newModel.model_id.trim() || !newModel.name.trim()}>Add Model</Button>
+              </div>
+            </Card>
+          )}
+
+          {/* Model Edit Modal */}
+          {editModel && (
+            <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.7)", zIndex: 1000, display: "flex", alignItems: "center", justifyContent: "center", padding: 20 }}>
+              <div style={{ background: theme.bgCard, border: `1px solid ${theme.border}`, borderRadius: 16, padding: 32, width: "100%", maxWidth: 480 }}>
+                <div style={{ fontSize: 18, fontWeight: 700, color: theme.text, marginBottom: 24 }}>✏️ Edit Model</div>
+                <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+                  <div>
+                    <Label>Model ID</Label>
+                    <div style={{ padding: "10px 14px", background: theme.bgHover, borderRadius: 8, fontSize: 12, color: theme.textDim, fontFamily: "monospace" }}>{editModel.id}</div>
+                  </div>
+                  <div>
+                    <Label>Display Name</Label>
+                    <Input value={editModel.name} onChange={e => setEditModel(p => ({ ...p, name: e.target.value }))} />
+                  </div>
+                  <div>
+                    <Label>Provider</Label>
+                    <select value={editModel.provider} onChange={e => setEditModel(p => ({ ...p, provider: e.target.value }))}
+                      style={{ width: "100%", padding: "10px 14px", background: theme.bgInput, border: `1px solid ${theme.border}`, borderRadius: 8, color: theme.text, fontSize: 14, outline: "none" }}>
+                      <option value="openrouter">OpenRouter</option>
+                      <option value="anthropic">Anthropic</option>
+                      <option value="openai">OpenAI</option>
+                      <option value="google">Google</option>
+                    </select>
+                  </div>
+                  <div>
+                    <Label>Description</Label>
+                    <Input value={editModel.description || ""} onChange={e => setEditModel(p => ({ ...p, description: e.target.value }))} />
+                  </div>
+                  <label style={{ display: "flex", alignItems: "center", gap: 8, cursor: "pointer", color: theme.text, fontSize: 14 }}>
+                    <input type="checkbox" checked={editModel.enabled} onChange={e => setEditModel(p => ({ ...p, enabled: e.target.checked }))} style={{ width: 16, height: 16, accentColor: theme.accent }} />
+                    Enabled
+                  </label>
+                </div>
+                <div style={{ display: "flex", gap: 10, marginTop: 24 }}>
+                  <Button variant="ghost" onClick={() => setEditModel(null)} style={{ flex: 1 }}>Cancel</Button>
+                  <Button onClick={handleUpdateModel} style={{ flex: 2 }}>Save Changes</Button>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* Model List */}
+          <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+            {/* Group by provider */}
+            {["openrouter", "anthropic", "openai", "google"].map(provId => {
+              const provModels = models.filter(m => m.provider === provId);
+              if (provModels.length === 0) return null;
+              return (
+                <div key={provId}>
+                  <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8, marginTop: 16 }}>
+                    <span style={{ fontSize: 16 }}>{PROVIDER_ICONS[provId]}</span>
+                    <span style={{ fontSize: 12, fontWeight: 700, color: PROVIDER_COLORS[provId] || theme.textMuted, textTransform: "uppercase", letterSpacing: "0.5px" }}>
+                      {provId}
+                    </span>
+                    <div style={{ flex: 1, height: 1, background: theme.border }} />
+                  </div>
+                  {provModels.map(model => {
+                    const testResult = testResults[model.id];
+                    const isTesting = testingModel === model.id;
+                    return (
+                      <div key={model.id} style={{
+                        display: "flex", alignItems: "center", gap: 12,
+                        padding: "12px 16px",
+                        background: theme.bgCard,
+                        border: `1px solid ${model.enabled ? theme.border : theme.textDim + "33"}`,
+                        borderRadius: 10, marginBottom: 6,
+                        opacity: model.enabled ? 1 : 0.5,
+                        transition: "all 0.2s",
+                      }}>
+                        {/* Enable toggle dot */}
+                        <div style={{
+                          width: 8, height: 8, borderRadius: "50%", flexShrink: 0,
+                          background: model.enabled ? theme.success : theme.textDim,
+                          boxShadow: model.enabled ? `0 0 6px ${theme.success}` : "none",
+                        }} />
+                        <div style={{ flex: 1, minWidth: 0 }}>
+                          <div style={{ fontSize: 13, fontWeight: 600, color: theme.text }}>{model.name}</div>
+                          <div style={{ fontSize: 11, color: theme.textDim, fontFamily: "monospace", marginTop: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                            {model.model_id}
+                          </div>
+                          {model.description && <div style={{ fontSize: 11, color: theme.textMuted, marginTop: 2 }}>{model.description}</div>}
+                        </div>
+
+                        {/* Test result */}
+                        {testResult && (
+                          <span style={{
+                            fontSize: 11, padding: "3px 8px", borderRadius: 6, fontFamily: "monospace",
+                            background: testResult.success ? theme.successBg : theme.errorBg,
+                            color: testResult.success ? theme.success : theme.error,
+                          }}>
+                            {testResult.success ? `✓ ${testResult.elapsed_seconds}s` : "✗ fail"}
+                          </span>
+                        )}
+
+                        {model.custom && (
+                          <span style={{ fontSize: 10, padding: "2px 6px", borderRadius: 4, background: theme.accentGlow, color: theme.accent, fontWeight: 600 }}>CUSTOM</span>
+                        )}
+
+                        {/* Actions */}
+                        <div style={{ display: "flex", gap: 6, flexShrink: 0 }}>
+                          <Button
+                            id={`test-model-${model.id}`}
+                            variant="ghost"
+                            disabled={isTesting}
+                            onClick={() => handleTestModel(model.id)}
+                            style={{ padding: "4px 10px", fontSize: 11 }}
+                          >
+                            {isTesting ? "⏳" : "▶ Test"}
+                          </Button>
+                          <Button
+                            variant="ghost"
+                            onClick={() => setEditModel({ ...model })}
+                            style={{ padding: "4px 10px", fontSize: 11 }}
+                          >
+                            Edit
+                          </Button>
+                          {model.custom && (
+                            <Button
+                              variant="danger"
+                              onClick={() => handleDeleteModel(model.id)}
+                              style={{ padding: "4px 10px", fontSize: 11 }}
+                            >
+                              Del
+                            </Button>
+                          )}
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
+
+      {/* ── ROUTING TAB ── */}
+      {tab === "routing" && (
+        <div>
+          <SectionHeader
+            title="Task Complexity → Model Routing"
+            subtitle="Configure which models handle each complexity tier. Order = fallback priority (first = primary, rest = fallbacks)."
+            action={
+              <Button id="save-routing-btn" onClick={handleSaveRouting} variant="success" style={{ padding: "7px 18px", fontSize: 12 }}>
+                💾 Apply Routing
+              </Button>
+            }
+          />
+
+          <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
+            {["low", "medium", "high", "critical"].map(tier => (
+              <Card key={tier} style={{ padding: 0, overflow: "hidden", border: `1px solid ${TIER_COLORS[tier]}33` }}>
+                {/* Tier header */}
+                <div style={{
+                  padding: "12px 20px",
+                  background: `${TIER_COLORS[tier]}11`,
+                  borderBottom: `1px solid ${TIER_COLORS[tier]}22`,
+                  display: "flex", alignItems: "center", gap: 12,
+                }}>
+                  <div style={{ width: 10, height: 10, borderRadius: "50%", background: TIER_COLORS[tier], boxShadow: `0 0 8px ${TIER_COLORS[tier]}` }} />
+                  <span style={{ fontSize: 14, fontWeight: 700, color: TIER_COLORS[tier] }}>
+                    {TIER_LABELS[tier]} Complexity
+                  </span>
+                  <span style={{ fontSize: 12, color: theme.textMuted }}>
+                    {(routing[tier] || []).length} model{(routing[tier] || []).length !== 1 ? "s" : ""} configured
+                  </span>
+                </div>
+
+                <div style={{ padding: 16 }}>
+                  {/* Model chain */}
+                  <div style={{ display: "flex", flexDirection: "column", gap: 8, marginBottom: 12 }}>
+                    {(routing[tier] || []).length === 0 ? (
+                      <div style={{ padding: "16px", textAlign: "center", color: theme.textDim, fontSize: 13, border: `1px dashed ${theme.border}`, borderRadius: 8 }}>
+                        No models configured — add some below
+                      </div>
+                    ) : (
+                      (routing[tier] || []).map((modelId, idx) => (
+                        <div key={`${tier}-${idx}`} style={{
+                          display: "flex", alignItems: "center", gap: 10,
+                          padding: "10px 14px",
+                          background: idx === 0 ? `${TIER_COLORS[tier]}11` : theme.bgInput,
+                          border: `1px solid ${idx === 0 ? TIER_COLORS[tier] + "33" : theme.border}`,
+                          borderRadius: 8,
+                        }}>
+                          {/* Order badge */}
+                          <span style={{
+                            width: 22, height: 22, borderRadius: "50%", flexShrink: 0,
+                            display: "flex", alignItems: "center", justifyContent: "center",
+                            fontSize: 11, fontWeight: 700,
+                            background: idx === 0 ? TIER_COLORS[tier] : theme.bgHover,
+                            color: idx === 0 ? "#fff" : theme.textMuted,
+                          }}>
+                            {idx + 1}
+                          </span>
+                          <div style={{ flex: 1, minWidth: 0 }}>
+                            <div style={{ fontSize: 13, fontWeight: 600, color: idx === 0 ? theme.text : theme.textMuted }}>
+                              {models.find(m => m.id === modelId)?.name || modelId}
+                            </div>
+                            <div style={{ fontSize: 10, color: theme.textDim, fontFamily: "monospace", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                              {modelId}
+                            </div>
+                          </div>
+                          {idx === 0 && (
+                            <span style={{ fontSize: 10, padding: "2px 7px", borderRadius: 4, background: `${TIER_COLORS[tier]}22`, color: TIER_COLORS[tier], fontWeight: 600, textTransform: "uppercase" }}>
+                              Primary
+                            </span>
+                          )}
+                          {idx > 0 && (
+                            <span style={{ fontSize: 10, padding: "2px 7px", borderRadius: 4, background: theme.bgHover, color: theme.textDim, fontWeight: 600, textTransform: "uppercase" }}>
+                              Fallback {idx}
+                            </span>
+                          )}
+                          {/* Up/Down arrows */}
+                          <div style={{ display: "flex", flexDirection: "column", gap: 2, flexShrink: 0 }}>
+                            <button
+                              disabled={idx === 0}
+                              onClick={() => moveModelInTier(tier, idx, idx - 1)}
+                              style={{ background: "none", border: "none", color: idx === 0 ? theme.textDim : theme.textMuted, cursor: idx === 0 ? "default" : "pointer", fontSize: 12, lineHeight: 1, padding: "1px 4px" }}
+                            >▲</button>
+                            <button
+                              disabled={idx === (routing[tier] || []).length - 1}
+                              onClick={() => moveModelInTier(tier, idx, idx + 1)}
+                              style={{ background: "none", border: "none", color: idx === (routing[tier] || []).length - 1 ? theme.textDim : theme.textMuted, cursor: idx === (routing[tier] || []).length - 1 ? "default" : "pointer", fontSize: 12, lineHeight: 1, padding: "1px 4px" }}
+                            >▼</button>
+                          </div>
+                          <button
+                            onClick={() => removeFromTier(tier, idx)}
+                            style={{ background: "none", border: "none", color: theme.error, cursor: "pointer", fontSize: 14, padding: "2px 4px" }}
+                          >×</button>
+                        </div>
+                      ))
+                    )}
+                  </div>
+
+                  {/* Add model to tier */}
+                  <AddModelToTier tier={tier} models={models} existing={routing[tier] || []} onAdd={addToTier} />
+                </div>
+              </Card>
+            ))}
+          </div>
+
+          <div style={{ marginTop: 24, padding: 16, background: theme.bgCard, border: `1px solid ${theme.border}`, borderRadius: 10 }}>
+            <div style={{ fontSize: 12, color: theme.textMuted, lineHeight: 1.6 }}>
+              <strong style={{ color: theme.text }}>How routing works:</strong> When an agent needs to make an LLM call, it specifies a task complexity level.
+              The first model in the tier's list is tried first. If it fails, the system automatically falls back to the next model in order.
+              Changes here take effect immediately — no restart required.
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+};
+
+// Sub-component for adding a model to a tier
+const AddModelToTier = ({ tier, models, existing, onAdd }) => {
+  const [selected, setSelected] = useState("");
+  const available = models.filter(m => m.enabled && !existing.includes(m.id));
+
+  return (
+    <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+      <select
+        value={selected}
+        onChange={e => setSelected(e.target.value)}
+        style={{ flex: 1, padding: "8px 12px", background: theme.bgInput, border: `1px solid ${theme.border}`, borderRadius: 8, color: selected ? theme.text : theme.textDim, fontSize: 13, outline: "none" }}
+      >
+        <option value="">+ Add model to {tier} tier...</option>
+        {["openrouter", "anthropic", "openai", "google"].map(prov => {
+          const provModels = available.filter(m => m.provider === prov);
+          if (provModels.length === 0) return null;
+          return (
+            <optgroup key={prov} label={prov.toUpperCase()}>
+              {provModels.map(m => (
+                <option key={m.id} value={m.id}>{m.name} ({m.model_id})</option>
+              ))}
+            </optgroup>
+          );
+        })}
+      </select>
+      <Button
+        variant="ghost"
+        disabled={!selected}
+        onClick={() => { onAdd(tier, selected); setSelected(""); }}
+        style={{ padding: "8px 14px", fontSize: 12, flexShrink: 0 }}
+      >
+        Add
+      </Button>
+    </div>
   );
 };
 
@@ -533,7 +1309,6 @@ const ProjectDetailPage = ({ projectId, onBack }) => {
         }
       };
       ws.onerror = () => {
-        // Fallback to polling events
         const pollEvents = async () => {
           try {
             const evts = await api.getEvents(projectId);
@@ -552,7 +1327,6 @@ const ProjectDetailPage = ({ projectId, onBack }) => {
     };
   }, [projectId]);
 
-  // Auto-scroll events
   useEffect(() => {
     eventsEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [events]);
@@ -592,12 +1366,11 @@ const ProjectDetailPage = ({ projectId, onBack }) => {
         <button onClick={onBack} style={{ background: "none", border: "none", color: theme.textMuted, cursor: "pointer", fontSize: 18 }}>←</button>
         <h1 style={{ fontSize: 22, fontWeight: 700, color: theme.text, margin: 0, flex: 1 }}>{project.name}</h1>
         {project.status === "failed" && (
-          <Button 
-            variant="primary" 
+          <Button
+            variant="primary"
             onClick={async () => {
               try {
                 await api.rebuildProject(projectId);
-                // Reset status locally for immediate feedback
                 setProject(prev => ({ ...prev, status: "analyzing" }));
               } catch (e) { console.error(e); }
             }}
@@ -723,7 +1496,6 @@ const ProjectDetailPage = ({ projectId, onBack }) => {
 
       {tab === "files" && (
         <div style={{ display: "grid", gridTemplateColumns: "240px 1fr", gap: 12, minHeight: 400 }}>
-          {/* File tree */}
           <Card style={{ padding: 8, overflowY: "auto", maxHeight: 500 }}>
             {Object.keys(files).length === 0 ? (
               <div style={{ padding: 20, textAlign: "center", color: theme.textDim, fontSize: 12 }}>
@@ -750,7 +1522,6 @@ const ProjectDetailPage = ({ projectId, onBack }) => {
               ))
             )}
           </Card>
-          {/* File content */}
           <Card style={{ padding: 0, overflow: "hidden" }}>
             {selectedFile ? (
               <div>
@@ -843,7 +1614,7 @@ const ProjectDetailPage = ({ projectId, onBack }) => {
 // Home / Project List Page
 // ──────────────────────────────────────────────
 
-const HomePage = ({ onSelectProject, onNewProject }) => {
+const HomePage = ({ onSelectProject, onNewProject, onSettings }) => {
   const [projects, setProjects] = useState([]);
   const [metrics, setMetrics] = useState({});
 
@@ -864,6 +1635,31 @@ const HomePage = ({ onSelectProject, onNewProject }) => {
     <div style={{ maxWidth: 960, margin: "0 auto", padding: "40px 20px" }}>
       {/* Hero */}
       <div style={{ textAlign: "center", marginBottom: 48 }}>
+        <div style={{ display: "flex", justifyContent: "flex-end", marginBottom: 12 }}>
+          <button
+            id="llm-settings-btn"
+            onClick={onSettings}
+            title="LLM Model Settings"
+            style={{
+              background: "none",
+              border: `1px solid ${theme.border}`,
+              borderRadius: 8,
+              color: theme.textMuted,
+              cursor: "pointer",
+              fontSize: 13,
+              fontWeight: 600,
+              padding: "7px 14px",
+              display: "flex",
+              alignItems: "center",
+              gap: 6,
+              transition: "all 0.2s",
+            }}
+            onMouseEnter={e => { e.currentTarget.style.borderColor = theme.accent; e.currentTarget.style.color = theme.accent; }}
+            onMouseLeave={e => { e.currentTarget.style.borderColor = theme.border; e.currentTarget.style.color = theme.textMuted; }}
+          >
+            ⚙️ LLM Settings
+          </button>
+        </div>
         <h1 style={{ fontSize: 40, fontWeight: 800, color: theme.text, margin: "0 0 8px 0", letterSpacing: "-1px" }}>
           <span style={{ color: theme.accent }}>⚒</span> FORGE
         </h1>
@@ -887,7 +1683,7 @@ const HomePage = ({ onSelectProject, onNewProject }) => {
       </div>
 
       {/* New Project Button */}
-      <Button onClick={onNewProject} style={{ width: "100%", padding: 16, fontSize: 15, marginBottom: 24 }}>
+      <Button id="create-project-btn" onClick={onNewProject} style={{ width: "100%", padding: 16, fontSize: 15, marginBottom: 24 }}>
         + Create New Project
       </Button>
 
@@ -923,7 +1719,7 @@ const HomePage = ({ onSelectProject, onNewProject }) => {
 // ──────────────────────────────────────────────
 
 export default function App() {
-  const [page, setPage] = useState("home"); // "home" | "create" | "detail"
+  const [page, setPage] = useState("home"); // "home" | "create" | "detail" | "llm-settings"
   const [selectedProject, setSelectedProject] = useState(null);
 
   return (
@@ -939,6 +1735,7 @@ export default function App() {
         <HomePage
           onSelectProject={(id) => { setSelectedProject(id); setPage("detail"); }}
           onNewProject={() => setPage("create")}
+          onSettings={() => setPage("llm-settings")}
         />
       )}
 
@@ -954,6 +1751,10 @@ export default function App() {
           projectId={selectedProject}
           onBack={() => setPage("home")}
         />
+      )}
+
+      {page === "llm-settings" && (
+        <LLMSettingsPage onBack={() => setPage("home")} />
       )}
     </div>
   );
