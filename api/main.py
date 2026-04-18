@@ -23,6 +23,7 @@ from pydantic import BaseModel
 from forge_core.config import settings, MODEL_ROUTING, TaskComplexity, LLMModel
 from forge_core.events import event_bus
 from forge_core.llm.gateway import llm_gateway
+from forge_core.llm.rate_limiter import rate_limiter, ModelLimits
 from forge_core.models import BuildEvent, ProjectStatus
 from forge_core.orchestrator import orchestrator
 
@@ -84,6 +85,11 @@ class LLMConfigStore:
                 "enabled": True,
                 "custom": False,
                 "description": "",
+                # Rate-limit fields
+                "rpm_limit": 0,
+                "max_input_tokens": 0,
+                "max_tokens_per_minute": 0,
+                "max_tokens_per_day": 0,
             }
 
         # Build default routing from config
@@ -102,33 +108,68 @@ class LLMConfigStore:
             return "openrouter"
         return "openrouter"
 
+    def _apply_provider_env(self, provider_id: str):
+        """Apply a provider's credentials to environment variables for LiteLLM."""
+        p = self._providers[provider_id]
+        key = p.get("api_key", "")
+        url = p.get("base_url", "")
+        if provider_id == "openrouter":
+            if key: os.environ["OPENROUTER_API_KEY"] = key
+            if url: os.environ["OPENROUTER_API_BASE"] = url
+        elif provider_id == "anthropic":
+            if key: os.environ["ANTHROPIC_API_KEY"] = key
+        elif provider_id == "openai":
+            if key: os.environ["OPENAI_API_KEY"] = key
+        elif provider_id == "google":
+            if key: os.environ["GEMINI_API_KEY"] = key
+        else:
+            # Custom provider: expose via per-provider env vars that LiteLLM
+            # can pick up when using openai-compatible format:
+            #   model = "openai/<model_name>"
+            #   OPENAI_API_KEY + OPENAI_API_BASE
+            # We namespace with the provider id so multiple customs don't clash.
+            env_prefix = provider_id.upper().replace("-", "_")
+            if key: os.environ[f"{env_prefix}_API_KEY"] = key
+            if url: os.environ[f"{env_prefix}_API_BASE"] = url
+        llm_gateway._configure_keys()
+
     # --- Providers ---
     def get_providers(self) -> list[dict]:
         return list(self._providers.values())
+
+    def add_provider(self, data: dict) -> dict:
+        provider_id = data["id"].lower().strip().replace(" ", "-")
+        if provider_id in self._providers:
+            raise ValueError(f"Provider '{provider_id}' already exists")
+        entry = {
+            "id": provider_id,
+            "name": data.get("name", provider_id),
+            "api_key": data.get("api_key", ""),
+            "base_url": data.get("base_url", ""),
+            "enabled": bool(data.get("api_key", "")),
+            "custom": True,
+            "model_prefix": data.get("model_prefix", ""),
+            "description": data.get("description", ""),
+            "compatible_with": data.get("compatible_with", "openai"),  # openai|anthropic|custom
+        }
+        self._providers[provider_id] = entry
+        self._apply_provider_env(provider_id)
+        return entry
 
     def update_provider(self, provider_id: str, data: dict) -> dict:
         if provider_id not in self._providers:
             raise KeyError(f"Provider '{provider_id}' not found")
         self._providers[provider_id].update(data)
-        # Apply env vars so LiteLLM picks them up
-        p = self._providers[provider_id]
-        if provider_id == "openrouter":
-            if p.get("api_key"):
-                os.environ["OPENROUTER_API_KEY"] = p["api_key"]
-            if p.get("base_url"):
-                os.environ["OPENROUTER_API_BASE"] = p["base_url"]
-        elif provider_id == "anthropic":
-            if p.get("api_key"):
-                os.environ["ANTHROPIC_API_KEY"] = p["api_key"]
-        elif provider_id == "openai":
-            if p.get("api_key"):
-                os.environ["OPENAI_API_KEY"] = p["api_key"]
-        elif provider_id == "google":
-            if p.get("api_key"):
-                os.environ["GEMINI_API_KEY"] = p["api_key"]
-        # Refresh gateway keys
-        llm_gateway._configure_keys()
+        self._apply_provider_env(provider_id)
         return self._providers[provider_id]
+
+    def delete_provider(self, provider_id: str):
+        builtin = {"openrouter", "anthropic", "openai", "google"}
+        if provider_id in builtin:
+            raise ValueError(f"Cannot delete built-in provider '{provider_id}'")
+        if provider_id not in self._providers:
+            raise KeyError(f"Provider '{provider_id}' not found")
+        del self._providers[provider_id]
 
     # --- Models ---
     def get_models(self) -> list[dict]:
@@ -146,6 +187,10 @@ class LLMConfigStore:
             "enabled": data.get("enabled", True),
             "custom": True,
             "description": data.get("description", ""),
+            "rpm_limit": data.get("rpm_limit", 0),
+            "max_input_tokens": data.get("max_input_tokens", 0),
+            "max_tokens_per_minute": data.get("max_tokens_per_minute", 0),
+            "max_tokens_per_day": data.get("max_tokens_per_day", 0),
         }
         self._models[model_id] = entry
         return entry
@@ -154,6 +199,14 @@ class LLMConfigStore:
         if model_id not in self._models:
             raise KeyError(f"Model '{model_id}' not found")
         self._models[model_id].update(data)
+        # Sync rate limits to rate_limiter singleton
+        m = self._models[model_id]
+        rate_limiter.set_limits(model_id, ModelLimits(
+            rpm=m.get("rpm_limit", 0),
+            max_input_tokens=m.get("max_input_tokens", 0),
+            max_tokens_per_minute=m.get("max_tokens_per_minute", 0),
+            max_tokens_per_day=m.get("max_tokens_per_day", 0),
+        ))
         return self._models[model_id]
 
     def delete_model(self, model_id: str):
@@ -479,10 +532,24 @@ async def get_config():
 # LLM Configuration Endpoints
 # ──────────────────────────────────────────────
 
+class ProviderCreateRequest(BaseModel):
+    id: str                          # slug, e.g. "ollama" or "azure-east"
+    name: str                        # display name, e.g. "Ollama (Local)"
+    base_url: str                    # required endpoint
+    api_key: str = ""                # empty for local/no-auth providers
+    model_prefix: str = ""           # LiteLLM prefix e.g. "ollama" or "openai"
+    compatible_with: str = "openai"  # openai | anthropic | custom
+    description: str = ""
+
+
 class ProviderUpdateRequest(BaseModel):
+    name: Optional[str] = None
     api_key: Optional[str] = None
     base_url: Optional[str] = None
     enabled: Optional[bool] = None
+    model_prefix: Optional[str] = None
+    compatible_with: Optional[str] = None
+    description: Optional[str] = None
 
 
 class ModelCreateRequest(BaseModel):
@@ -530,6 +597,16 @@ async def get_providers():
     return safe
 
 
+@app.post("/api/llm/providers", status_code=201)
+async def add_provider(req: ProviderCreateRequest):
+    """Add a custom LLM provider."""
+    try:
+        provider = _llm_config.add_provider(req.model_dump())
+        return {"message": "Provider added", "provider": {k: v for k, v in provider.items() if k != "api_key"}}
+    except ValueError as e:
+        raise HTTPException(409, str(e))
+
+
 @app.put("/api/llm/providers/{provider_id}")
 async def update_provider(provider_id: str, req: ProviderUpdateRequest):
     """Update a provider's API key, endpoint, or enabled status."""
@@ -537,6 +614,18 @@ async def update_provider(provider_id: str, req: ProviderUpdateRequest):
         data = req.model_dump(exclude_none=True)
         updated = _llm_config.update_provider(provider_id, data)
         return {"message": "Provider updated", "provider_id": provider_id, "enabled": updated.get("enabled")}
+    except KeyError as e:
+        raise HTTPException(404, str(e))
+
+
+@app.delete("/api/llm/providers/{provider_id}")
+async def delete_provider(provider_id: str):
+    """Delete a custom provider (built-in providers cannot be deleted)."""
+    try:
+        _llm_config.delete_provider(provider_id)
+        return {"message": f"Provider '{provider_id}' deleted"}
+    except ValueError as e:
+        raise HTTPException(400, str(e))
     except KeyError as e:
         raise HTTPException(404, str(e))
 
@@ -600,7 +689,7 @@ async def test_model(req: ModelTestRequest):
             model=req.model_id,
             messages=[{"role": "user", "content": "Reply with exactly: OK"}],
             max_tokens=10,
-            temperature=0,
+            temperature=0
         )
         elapsed = round(time.time() - start, 2)
         content = response.choices[0].message.content or ""
@@ -608,6 +697,60 @@ async def test_model(req: ModelTestRequest):
     except Exception as e:
         elapsed = round(time.time() - start, 2)
         return {"success": False, "error": str(e)[:300], "elapsed_seconds": elapsed, "model": req.model_id}
+
+
+# ──────────────────────────────────────────────
+# LLM Limits & Usage Endpoints
+# ──────────────────────────────────────────────
+
+class ModelLimitsRequest(BaseModel):
+    rpm_limit: int = 0
+    max_input_tokens: int = 0
+    max_tokens_per_minute: int = 0
+    max_tokens_per_day: int = 0
+
+
+@app.get("/api/llm/limits")
+async def get_all_limits():
+    """Get rate limits for all models."""
+    models = _llm_config.get_models()
+    result = []
+    for m in models:
+        stats = rate_limiter.get_model_stats(m["id"])
+        result.append({
+            **m,
+            "live_stats": stats["live"],
+            "usage": stats["usage"],
+        })
+    return result
+
+
+@app.put("/api/llm/limits/{model_id:path}")
+async def set_model_limits(model_id: str, req: ModelLimitsRequest):
+    """Set rate limits for a specific model."""
+    try:
+        updated = _llm_config.update_model(model_id, req.model_dump())
+        return {"message": f"Limits updated for {model_id}", "model": updated}
+    except KeyError as e:
+        raise HTTPException(404, str(e))
+
+
+@app.get("/api/llm/usage")
+async def get_usage_stats():
+    """Get full per-minute/day/week usage stats for all tracked models."""
+    return rate_limiter.get_all_stats()
+
+
+@app.get("/api/llm/failover-events")
+async def get_failover_events(limit: int = 50):
+    """Get recent automatic model failover events."""
+    return rate_limiter.get_failover_log(limit)
+
+
+@app.get("/api/llm/metrics/rich")
+async def get_rich_metrics():
+    """Get rich per-model metrics from the gateway (minute/day/week)."""
+    return llm_gateway.get_rich_metrics()
 
 
 # ──────────────────────────────────────────────

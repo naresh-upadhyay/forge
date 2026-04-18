@@ -169,6 +169,39 @@ const api = {
     });
     return r.json();
   },
+  // LLM Limits & Usage
+  async getLLMUsage() {
+    const r = await fetch(`${API_URL}/api/llm/usage`);
+    return r.json();
+  },
+  async getLLMLimits() {
+    const r = await fetch(`${API_URL}/api/llm/limits`);
+    return r.json();
+  },
+  async setModelLimits(modelId, data) {
+    const r = await fetch(`${API_URL}/api/llm/limits/${encodeURIComponent(modelId)}`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(data),
+    });
+    return r.json();
+  },
+  async getFailoverEvents(limit = 50) {
+    const r = await fetch(`${API_URL}/api/llm/failover-events?limit=${limit}`);
+    return r.json();
+  },
+  async addLLMProvider(data) {
+    const r = await fetch(`${API_URL}/api/llm/providers`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(data),
+    });
+    return r.json();
+  },
+  async deleteLLMProvider(providerId) {
+    const r = await fetch(`${API_URL}/api/llm/providers/${encodeURIComponent(providerId)}`, { method: "DELETE" });
+    return r.json();
+  },
 };
 
 // ──────────────────────────────────────────────
@@ -361,7 +394,7 @@ const LLMSettingsPage = ({ onBack }) => {
   const [testingModel, setTestingModel] = useState(null);
 
   // Provider edit state
-  const [editProvider, setEditProvider] = useState(null); // {id, api_key, base_url, enabled}
+  const [editProvider, setEditProvider] = useState(null);
 
   // Model add/edit state
   const [showAddModel, setShowAddModel] = useState(false);
@@ -369,7 +402,25 @@ const LLMSettingsPage = ({ onBack }) => {
   const [editModel, setEditModel] = useState(null);
 
   // Routing drag state
-  const [dragItem, setDragItem] = useState(null); // {tier, index}
+  const [dragItem, setDragItem] = useState(null);
+
+  // Usage & Limits state
+  const [usageData, setUsageData] = useState([]);
+  const [failoverEvents, setFailoverEvents] = useState([]);
+  const [limitsData, setLimitsData] = useState([]);
+  const [editLimits, setEditLimits] = useState({});
+  const [savingLimits, setSavingLimits] = useState({});
+
+  // Delete model confirmation
+  const [deletingModel, setDeletingModel] = useState(null);
+
+  // Custom provider add state
+  const [showAddProvider, setShowAddProvider] = useState(false);
+  const [newProvider, setNewProvider] = useState({
+    id: "", name: "", base_url: "", api_key: "",
+    model_prefix: "", compatible_with: "openai", description: "",
+  });
+  const [deletingProvider, setDeletingProvider] = useState(null);
 
   const showToast = (message, type = "success") => setToast({ message, type });
 
@@ -391,7 +442,42 @@ const LLMSettingsPage = ({ onBack }) => {
     }
   }, []);
 
+  const loadUsage = useCallback(async () => {
+    try {
+      const [usage, events, limits] = await Promise.all([
+        api.getLLMUsage(),
+        api.getFailoverEvents(30),
+        api.getLLMLimits(),
+      ]);
+      setUsageData(Array.isArray(usage) ? usage : []);
+      setFailoverEvents(Array.isArray(events) ? events : []);
+      setLimitsData(Array.isArray(limits) ? limits : []);
+      setEditLimits(prev => {
+        const next = { ...prev };
+        (Array.isArray(limits) ? limits : []).forEach(m => {
+          if (!next[m.id]) {
+            next[m.id] = {
+              rpm_limit: m.rpm_limit || 0,
+              max_input_tokens: m.max_input_tokens || 0,
+              max_tokens_per_minute: m.max_tokens_per_minute || 0,
+              max_tokens_per_day: m.max_tokens_per_day || 0,
+            };
+          }
+        });
+        return next;
+      });
+    } catch {}
+  }, []);
+
   useEffect(() => { loadData(); }, [loadData]);
+
+  useEffect(() => {
+    if (tab === "usage") {
+      loadUsage();
+      const interval = setInterval(loadUsage, 5000);
+      return () => clearInterval(interval);
+    }
+  }, [tab, loadUsage]);
 
   // ── Provider Save ──
   const handleSaveProvider = async () => {
@@ -399,14 +485,44 @@ const LLMSettingsPage = ({ onBack }) => {
     try {
       const data = {};
       if (editProvider.api_key) data.api_key = editProvider.api_key;
-      if (editProvider.base_url) data.base_url = editProvider.base_url;
+      if (editProvider.base_url !== undefined) data.base_url = editProvider.base_url;
+      if (editProvider.name !== undefined) data.name = editProvider.name;
       if (editProvider.enabled !== undefined) data.enabled = editProvider.enabled;
+      if (editProvider.model_prefix !== undefined) data.model_prefix = editProvider.model_prefix;
+      if (editProvider.compatible_with !== undefined) data.compatible_with = editProvider.compatible_with;
+      if (editProvider.description !== undefined) data.description = editProvider.description;
       await api.updateLLMProvider(editProvider.id, data);
       setEditProvider(null);
       showToast("Provider updated successfully");
       loadData();
     } catch (e) {
       showToast("Failed to update provider", "error");
+    }
+  };
+
+  // ── Add Custom Provider ──
+  const handleAddProvider = async () => {
+    if (!newProvider.id.trim() || !newProvider.name.trim() || !newProvider.base_url.trim()) return;
+    try {
+      await api.addLLMProvider(newProvider);
+      setShowAddProvider(false);
+      setNewProvider({ id: "", name: "", base_url: "", api_key: "", model_prefix: "", compatible_with: "openai", description: "" });
+      showToast(`Provider "${newProvider.name}" added successfully`);
+      loadData();
+    } catch (e) {
+      showToast("Failed to add provider", "error");
+    }
+  };
+
+  // ── Delete Custom Provider ──
+  const handleDeleteProvider = async (providerId) => {
+    try {
+      await api.deleteLLMProvider(providerId);
+      setDeletingProvider(null);
+      showToast("Provider deleted");
+      loadData();
+    } catch (e) {
+      showToast(e.message || "Failed to delete provider", "error");
     }
   };
 
@@ -441,9 +557,9 @@ const LLMSettingsPage = ({ onBack }) => {
   };
 
   const handleDeleteModel = async (modelId) => {
-    if (!confirm(`Delete model "${modelId}"?`)) return;
     try {
       await api.deleteLLMModel(modelId);
+      setDeletingModel(null);
       showToast("Model deleted");
       loadData();
     } catch (e) {
@@ -544,6 +660,7 @@ const LLMSettingsPage = ({ onBack }) => {
           { id: "providers", label: "🔑 Providers & Keys" },
           { id: "models", label: "🤖 Models" },
           { id: "routing", label: "🔀 Task Routing" },
+          { id: "usage", label: "📊 Usage & Limits" },
         ].map(t => (
           <button key={t.id} onClick={() => setTab(t.id)} style={tabStyle(t.id)}>{t.label}</button>
         ))}
@@ -555,49 +672,116 @@ const LLMSettingsPage = ({ onBack }) => {
           <SectionHeader
             title="API Providers"
             subtitle="Set your API keys and endpoint URLs for each provider. Keys are stored in memory only."
+            action={
+              <Button id="add-provider-btn" onClick={() => setShowAddProvider(true)} style={{ padding: "7px 16px", fontSize: 12 }}>
+                + Add Custom Provider
+              </Button>
+            }
           />
+
+          {/* ── Add Custom Provider Form ── */}
+          {showAddProvider && (
+            <Card style={{ border: `1px solid ${theme.accent}44`, background: `${theme.accentGlow}` }}>
+              <div style={{ fontSize: 14, fontWeight: 700, color: theme.text, marginBottom: 18 }}>🔌 Add Custom Provider</div>
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14 }}>
+                <div>
+                  <Label>Provider ID <span style={{ color: theme.textDim, fontWeight: 400 }}>(slug, no spaces)</span></Label>
+                  <Input value={newProvider.id} onChange={e => setNewProvider(p => ({ ...p, id: e.target.value.toLowerCase().replace(/[^a-z0-9-]/g, "-") }))} placeholder="ollama, azure-east, mistral-local..." />
+                </div>
+                <div>
+                  <Label>Display Name</Label>
+                  <Input value={newProvider.name} onChange={e => setNewProvider(p => ({ ...p, name: e.target.value }))} placeholder="Ollama (Local), Azure East..." />
+                </div>
+                <div style={{ gridColumn: "1/-1" }}>
+                  <Label>Base URL / Endpoint <span style={{ color: theme.error, fontSize: 11 }}>*required</span></Label>
+                  <Input value={newProvider.base_url} onChange={e => setNewProvider(p => ({ ...p, base_url: e.target.value }))} placeholder="http://localhost:11434/v1  or  https://your-azure.openai.azure.com/..." />
+                </div>
+                <div>
+                  <Label>API Key <span style={{ color: theme.textDim, fontWeight: 400 }}>(leave blank for local/no-auth)</span></Label>
+                  <Input type="password" value={newProvider.api_key} onChange={e => setNewProvider(p => ({ ...p, api_key: e.target.value }))} placeholder="sk-... or bearer token" />
+                </div>
+                <div>
+                  <Label>LiteLLM Model Prefix</Label>
+                  <Input value={newProvider.model_prefix} onChange={e => setNewProvider(p => ({ ...p, model_prefix: e.target.value }))} placeholder="ollama, openai, mistral..." />
+                  <div style={{ fontSize: 10, color: theme.textDim, marginTop: 4 }}>Prepended to model names when calling LiteLLM, e.g. "ollama/llama3"</div>
+                </div>
+                <div>
+                  <Label>API Compatibility</Label>
+                  <select value={newProvider.compatible_with} onChange={e => setNewProvider(p => ({ ...p, compatible_with: e.target.value }))}
+                    style={{ width: "100%", padding: "10px 14px", background: theme.bgInput, border: `1px solid ${theme.border}`, borderRadius: 8, color: theme.text, fontSize: 14, outline: "none" }}>
+                    <option value="openai">OpenAI-compatible (Ollama, vLLM, LM Studio, Azure...)</option>
+                    <option value="anthropic">Anthropic-compatible</option>
+                    <option value="openrouter">OpenRouter-compatible</option>
+                    <option value="custom">Custom / Other</option>
+                  </select>
+                </div>
+                <div>
+                  <Label>Description <span style={{ color: theme.textDim, fontWeight: 400 }}>(optional)</span></Label>
+                  <Input value={newProvider.description} onChange={e => setNewProvider(p => ({ ...p, description: e.target.value }))} placeholder="Local Ollama instance, GPU server..." />
+                </div>
+              </div>
+              {/* Quick-fill presets */}
+              <div style={{ marginTop: 14, display: "flex", gap: 8, flexWrap: "wrap" }}>
+                <span style={{ fontSize: 11, color: theme.textDim, alignSelf: "center" }}>Quick presets:</span>
+                {[
+                  { label: "🦙 Ollama", id: "ollama", name: "Ollama (Local)", base_url: "http://localhost:11434/v1", model_prefix: "ollama", compatible_with: "openai", api_key: "" },
+                  { label: "🌐 LM Studio", id: "lmstudio", name: "LM Studio", base_url: "http://localhost:1234/v1", model_prefix: "openai", compatible_with: "openai", api_key: "lm-studio" },
+                  { label: "⚡ Azure OpenAI", id: "azure", name: "Azure OpenAI", base_url: "https://YOUR_RESOURCE.openai.azure.com/", model_prefix: "azure", compatible_with: "openai", api_key: "" },
+                  { label: "🚀 vLLM", id: "vllm", name: "vLLM Server", base_url: "http://localhost:8000/v1", model_prefix: "openai", compatible_with: "openai", api_key: "" },
+                  { label: "🤖 Together AI", id: "together", name: "Together AI", base_url: "https://api.together.xyz/v1", model_prefix: "together_ai", compatible_with: "openai", api_key: "" },
+                  { label: "🔥 Groq", id: "groq", name: "Groq", base_url: "https://api.groq.com/openai/v1", model_prefix: "groq", compatible_with: "openai", api_key: "" },
+                ].map(preset => (
+                  <button key={preset.id} onClick={() => setNewProvider(p => ({ ...p, ...preset }))}
+                    style={{ padding: "4px 10px", borderRadius: 6, fontSize: 11, fontWeight: 600, background: theme.bgHover, border: `1px solid ${theme.border}`, color: theme.textMuted, cursor: "pointer" }}>
+                    {preset.label}
+                  </button>
+                ))}
+              </div>
+              <div style={{ display: "flex", gap: 10, marginTop: 18 }}>
+                <Button variant="ghost" onClick={() => { setShowAddProvider(false); setNewProvider({ id: "", name: "", base_url: "", api_key: "", model_prefix: "", compatible_with: "openai", description: "" }); }}>Cancel</Button>
+                <Button onClick={handleAddProvider} disabled={!newProvider.id.trim() || !newProvider.name.trim() || !newProvider.base_url.trim()}>Add Provider</Button>
+              </div>
+            </Card>
+          )}
+
+          {/* Provider List */}
           {providers.map(prov => (
-            <Card key={prov.id} style={{ padding: 0, overflow: "hidden" }}>
+            <Card key={prov.id} style={{ padding: 0, overflow: "hidden", border: prov.custom ? `1px solid ${theme.accent}33` : undefined }}>
               <div style={{ padding: "16px 20px", display: "flex", alignItems: "center", gap: 14 }}>
-                {/* Provider icon */}
+                {/* Icon */}
                 <div style={{
                   width: 44, height: 44, borderRadius: 10, flexShrink: 0,
-                  background: `${PROVIDER_COLORS[prov.id] || "#444"}22`,
-                  border: `1px solid ${PROVIDER_COLORS[prov.id] || "#444"}44`,
+                  background: `${PROVIDER_COLORS[prov.id] || theme.accent}22`,
+                  border: `1px solid ${PROVIDER_COLORS[prov.id] || theme.accent}44`,
                   display: "flex", alignItems: "center", justifyContent: "center", fontSize: 22,
                 }}>
                   {PROVIDER_ICONS[prov.id] || "🔌"}
                 </div>
                 <div style={{ flex: 1, minWidth: 0 }}>
-                  <div style={{ fontSize: 15, fontWeight: 700, color: theme.text }}>{prov.name}</div>
-                  <div style={{ fontSize: 12, color: theme.textMuted, marginTop: 2, fontFamily: "monospace" }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                    <div style={{ fontSize: 15, fontWeight: 700, color: theme.text }}>{prov.name}</div>
+                    {prov.custom && <span style={{ fontSize: 9, padding: "2px 7px", borderRadius: 4, background: `${theme.accent}22`, color: theme.accent, fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.5px" }}>Custom</span>}
+                    {prov.compatible_with && prov.custom && <span style={{ fontSize: 9, padding: "2px 7px", borderRadius: 4, background: theme.bgHover, color: theme.textDim, fontWeight: 600 }}>{prov.compatible_with}</span>}
+                  </div>
+                  <div style={{ fontSize: 12, color: theme.textMuted, marginTop: 2, fontFamily: "monospace", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
                     {prov.base_url}
                   </div>
+                  {prov.model_prefix && <div style={{ fontSize: 10, color: theme.textDim, marginTop: 1 }}>prefix: <span style={{ fontFamily: "monospace", color: theme.accent }}>{prov.model_prefix}/</span></div>}
+                  {prov.description && <div style={{ fontSize: 11, color: theme.textDim, marginTop: 2 }}>{prov.description}</div>}
                 </div>
-                {/* Key status badge */}
-                <span style={{
-                  padding: "4px 12px", borderRadius: 20, fontSize: 11, fontWeight: 600,
-                  background: prov.has_key ? theme.successBg : theme.errorBg,
-                  color: prov.has_key ? theme.success : theme.error,
-                  border: `1px solid ${prov.has_key ? theme.success : theme.error}33`,
-                }}>
+                {/* Status badges */}
+                <span style={{ padding: "4px 12px", borderRadius: 20, fontSize: 11, fontWeight: 600, background: prov.has_key ? theme.successBg : theme.errorBg, color: prov.has_key ? theme.success : theme.error, border: `1px solid ${prov.has_key ? theme.success : theme.error}33` }}>
                   {prov.has_key ? "✓ Key Set" : "No Key"}
                 </span>
-                {/* Enabled toggle */}
-                <div style={{
-                  padding: "4px 12px", borderRadius: 20, fontSize: 11, fontWeight: 600,
-                  background: prov.enabled ? theme.accentGlow : `${theme.textDim}22`,
-                  color: prov.enabled ? theme.accent : theme.textDim,
-                  border: `1px solid ${prov.enabled ? theme.accent : theme.textDim}33`,
-                }}>
+                <div style={{ padding: "4px 12px", borderRadius: 20, fontSize: 11, fontWeight: 600, background: prov.enabled ? theme.accentGlow : `${theme.textDim}22`, color: prov.enabled ? theme.accent : theme.textDim, border: `1px solid ${prov.enabled ? theme.accent : theme.textDim}33` }}>
                   {prov.enabled ? "Enabled" : "Disabled"}
                 </div>
-                <Button variant="ghost" onClick={() => setEditProvider({ ...prov, api_key: "" })} style={{ padding: "6px 14px", fontSize: 12 }}>
-                  Edit
-                </Button>
+                <Button variant="ghost" onClick={() => setEditProvider({ ...prov, api_key: "" })} style={{ padding: "6px 14px", fontSize: 12 }}>Edit</Button>
+                {prov.custom && (
+                  <Button variant="danger" onClick={() => setDeletingProvider(prov)} style={{ padding: "6px 12px", fontSize: 12 }}>🗑</Button>
+                )}
               </div>
-
-              {/* Collapsible key display */}
+              {/* Masked key display */}
               {prov.has_key && (
                 <div style={{ padding: "0 20px 14px 78px" }}>
                   <div style={{ fontFamily: "monospace", fontSize: 12, color: theme.textDim, background: theme.bgInput, padding: "6px 12px", borderRadius: 6, display: "inline-block" }}>
@@ -610,40 +794,51 @@ const LLMSettingsPage = ({ onBack }) => {
 
           {/* Edit Provider Modal */}
           {editProvider && (
-            <div style={{
-              position: "fixed", inset: 0, background: "rgba(0,0,0,0.7)", zIndex: 1000,
-              display: "flex", alignItems: "center", justifyContent: "center", padding: 20,
-            }}>
-              <div style={{ background: theme.bgCard, border: `1px solid ${theme.border}`, borderRadius: 16, padding: 32, width: "100%", maxWidth: 520 }}>
+            <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.7)", zIndex: 1000, display: "flex", alignItems: "center", justifyContent: "center", padding: 20 }}>
+              <div style={{ background: theme.bgCard, border: `1px solid ${theme.border}`, borderRadius: 16, padding: 32, width: "100%", maxWidth: 540 }}>
                 <div style={{ fontSize: 18, fontWeight: 700, color: theme.text, marginBottom: 24 }}>
-                  {PROVIDER_ICONS[editProvider.id]} Edit {editProvider.name}
+                  {PROVIDER_ICONS[editProvider.id] || "🔌"} Edit {editProvider.name}
                 </div>
-                <div style={{ display: "flex", flexDirection: "column", gap: 18 }}>
+                <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+                  {editProvider.custom && (
+                    <div>
+                      <Label>Display Name</Label>
+                      <Input value={editProvider.name || ""} onChange={e => setEditProvider(p => ({ ...p, name: e.target.value }))} placeholder="Provider name" />
+                    </div>
+                  )}
                   <div>
                     <Label>API Key {editProvider.has_key && <span style={{ color: theme.textDim, fontWeight: 400 }}>(leave blank to keep existing)</span>}</Label>
-                    <Input
-                      type="password"
-                      value={editProvider.api_key}
-                      onChange={e => setEditProvider(p => ({ ...p, api_key: e.target.value }))}
-                      placeholder={editProvider.has_key ? "••••••••••••••••••••" : "sk-or-v1-..."}
-                    />
+                    <Input type="password" value={editProvider.api_key} onChange={e => setEditProvider(p => ({ ...p, api_key: e.target.value }))} placeholder={editProvider.has_key ? "••••••••••••••••••••" : "sk-or-v1-..."} />
                   </div>
                   <div>
                     <Label>Base URL / Endpoint</Label>
-                    <Input
-                      value={editProvider.base_url}
-                      onChange={e => setEditProvider(p => ({ ...p, base_url: e.target.value }))}
-                      placeholder="https://openrouter.ai/api/v1/"
-                    />
+                    <Input value={editProvider.base_url || ""} onChange={e => setEditProvider(p => ({ ...p, base_url: e.target.value }))} placeholder="https://openrouter.ai/api/v1/" />
                   </div>
+                  {editProvider.custom && (
+                    <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14 }}>
+                      <div>
+                        <Label>Model Prefix</Label>
+                        <Input value={editProvider.model_prefix || ""} onChange={e => setEditProvider(p => ({ ...p, model_prefix: e.target.value }))} placeholder="ollama, openai..." />
+                      </div>
+                      <div>
+                        <Label>API Compatibility</Label>
+                        <select value={editProvider.compatible_with || "openai"} onChange={e => setEditProvider(p => ({ ...p, compatible_with: e.target.value }))}
+                          style={{ width: "100%", padding: "10px 14px", background: theme.bgInput, border: `1px solid ${theme.border}`, borderRadius: 8, color: theme.text, fontSize: 14, outline: "none" }}>
+                          <option value="openai">OpenAI-compatible</option>
+                          <option value="anthropic">Anthropic-compatible</option>
+                          <option value="openrouter">OpenRouter-compatible</option>
+                          <option value="custom">Custom / Other</option>
+                        </select>
+                      </div>
+                      <div style={{ gridColumn: "1/-1" }}>
+                        <Label>Description</Label>
+                        <Input value={editProvider.description || ""} onChange={e => setEditProvider(p => ({ ...p, description: e.target.value }))} placeholder="Brief description..." />
+                      </div>
+                    </div>
+                  )}
                   <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
                     <label style={{ display: "flex", alignItems: "center", gap: 8, cursor: "pointer", color: theme.text, fontSize: 14 }}>
-                      <input
-                        type="checkbox"
-                        checked={editProvider.enabled}
-                        onChange={e => setEditProvider(p => ({ ...p, enabled: e.target.checked }))}
-                        style={{ width: 16, height: 16, accentColor: theme.accent }}
-                      />
+                      <input type="checkbox" checked={editProvider.enabled} onChange={e => setEditProvider(p => ({ ...p, enabled: e.target.checked }))} style={{ width: 16, height: 16, accentColor: theme.accent }} />
                       Enable this provider
                     </label>
                   </div>
@@ -651,6 +846,24 @@ const LLMSettingsPage = ({ onBack }) => {
                 <div style={{ display: "flex", gap: 10, marginTop: 28 }}>
                   <Button variant="ghost" onClick={() => setEditProvider(null)} style={{ flex: 1 }}>Cancel</Button>
                   <Button onClick={handleSaveProvider} style={{ flex: 2 }}>Save Changes</Button>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* Delete Confirmation Dialog */}
+          {deletingProvider && (
+            <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.75)", zIndex: 1000, display: "flex", alignItems: "center", justifyContent: "center", padding: 20 }}>
+              <div style={{ background: theme.bgCard, border: `1px solid ${theme.error}44`, borderRadius: 16, padding: 32, width: "100%", maxWidth: 420, textAlign: "center" }}>
+                <div style={{ fontSize: 36, marginBottom: 12 }}>🗑️</div>
+                <div style={{ fontSize: 17, fontWeight: 700, color: theme.text, marginBottom: 8 }}>Delete Provider?</div>
+                <div style={{ fontSize: 13, color: theme.textMuted, marginBottom: 24 }}>
+                  Are you sure you want to delete <strong style={{ color: theme.text }}>{deletingProvider.name}</strong>?<br />
+                  Any models using this provider will need to be reconfigured.
+                </div>
+                <div style={{ display: "flex", gap: 10 }}>
+                  <Button variant="ghost" onClick={() => setDeletingProvider(null)} style={{ flex: 1 }}>Cancel</Button>
+                  <Button variant="danger" onClick={() => handleDeleteProvider(deletingProvider.id)} style={{ flex: 1 }}>Delete</Button>
                 </div>
               </div>
             </div>
@@ -688,10 +901,9 @@ const LLMSettingsPage = ({ onBack }) => {
                   <Label>Provider</Label>
                   <select value={newModel.provider} onChange={e => setNewModel(p => ({ ...p, provider: e.target.value }))}
                     style={{ width: "100%", padding: "10px 14px", background: theme.bgInput, border: `1px solid ${theme.border}`, borderRadius: 8, color: theme.text, fontSize: 14, outline: "none" }}>
-                    <option value="openrouter">OpenRouter</option>
-                    <option value="anthropic">Anthropic</option>
-                    <option value="openai">OpenAI</option>
-                    <option value="google">Google</option>
+                    {providers.map(prov => (
+                      <option key={prov.id} value={prov.id}>{prov.name}{prov.custom ? " (custom)" : ""}</option>
+                    ))}
                   </select>
                 </div>
                 <div>
@@ -724,10 +936,9 @@ const LLMSettingsPage = ({ onBack }) => {
                     <Label>Provider</Label>
                     <select value={editModel.provider} onChange={e => setEditModel(p => ({ ...p, provider: e.target.value }))}
                       style={{ width: "100%", padding: "10px 14px", background: theme.bgInput, border: `1px solid ${theme.border}`, borderRadius: 8, color: theme.text, fontSize: 14, outline: "none" }}>
-                      <option value="openrouter">OpenRouter</option>
-                      <option value="anthropic">Anthropic</option>
-                      <option value="openai">OpenAI</option>
-                      <option value="google">Google</option>
+                      {providers.map(prov => (
+                        <option key={prov.id} value={prov.id}>{prov.name}{prov.custom ? " (custom)" : ""}</option>
+                      ))}
                     </select>
                   </div>
                   <div>
@@ -747,19 +958,21 @@ const LLMSettingsPage = ({ onBack }) => {
             </div>
           )}
 
-          {/* Model List */}
+          {/* Model List — grouped by all providers (built-in + custom) */}
           <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-            {/* Group by provider */}
-            {["openrouter", "anthropic", "openai", "google"].map(provId => {
+            {/* Get all unique providers from the models list */}
+            {Array.from(new Set(models.map(m => m.provider))).map(provId => {
               const provModels = models.filter(m => m.provider === provId);
               if (provModels.length === 0) return null;
+              const provInfo = providers.find(p => p.id === provId);
               return (
                 <div key={provId}>
                   <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8, marginTop: 16 }}>
-                    <span style={{ fontSize: 16 }}>{PROVIDER_ICONS[provId]}</span>
-                    <span style={{ fontSize: 12, fontWeight: 700, color: PROVIDER_COLORS[provId] || theme.textMuted, textTransform: "uppercase", letterSpacing: "0.5px" }}>
-                      {provId}
+                    <span style={{ fontSize: 16 }}>{PROVIDER_ICONS[provId] || "🔌"}</span>
+                    <span style={{ fontSize: 12, fontWeight: 700, color: PROVIDER_COLORS[provId] || theme.accent, textTransform: "uppercase", letterSpacing: "0.5px" }}>
+                      {provInfo ? provInfo.name : provId}
                     </span>
+                    {provInfo?.custom && <span style={{ fontSize: 9, padding: "1px 6px", borderRadius: 4, background: `${theme.accent}22`, color: theme.accent, fontWeight: 700 }}>CUSTOM</span>}
                     <div style={{ flex: 1, height: 1, background: theme.border }} />
                   </div>
                   {provModels.map(model => {
@@ -781,7 +994,7 @@ const LLMSettingsPage = ({ onBack }) => {
                           background: model.enabled ? theme.success : theme.textDim,
                           boxShadow: model.enabled ? `0 0 6px ${theme.success}` : "none",
                         }} />
-                        <div style={{ flex: 1, minWidth: 0 }}>
+                <div style={{ flex: 1, minWidth: 0 }}>
                           <div style={{ fontSize: 13, fontWeight: 600, color: theme.text }}>{model.name}</div>
                           <div style={{ fontSize: 11, color: theme.textDim, fontFamily: "monospace", marginTop: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
                             {model.model_id}
@@ -822,15 +1035,13 @@ const LLMSettingsPage = ({ onBack }) => {
                           >
                             Edit
                           </Button>
-                          {model.custom && (
-                            <Button
-                              variant="danger"
-                              onClick={() => handleDeleteModel(model.id)}
-                              style={{ padding: "4px 10px", fontSize: 11 }}
-                            >
-                              Del
-                            </Button>
-                          )}
+                          <Button
+                            variant="danger"
+                            onClick={() => setDeletingModel(model)}
+                            style={{ padding: "4px 10px", fontSize: 11, opacity: model.custom ? 1 : 0.65 }}
+                          >
+                            🗑
+                          </Button>
                         </div>
                       </div>
                     );
@@ -839,6 +1050,31 @@ const LLMSettingsPage = ({ onBack }) => {
               );
             })}
           </div>
+
+          {/* Delete Model Confirmation Modal */}
+          {deletingModel && (
+            <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.75)", zIndex: 1000, display: "flex", alignItems: "center", justifyContent: "center", padding: 20 }}>
+              <div style={{ background: theme.bgCard, border: `1px solid ${theme.error}44`, borderRadius: 16, padding: 32, width: "100%", maxWidth: 420, textAlign: "center" }}>
+                <div style={{ fontSize: 36, marginBottom: 12 }}>🗑️</div>
+                <div style={{ fontSize: 17, fontWeight: 700, color: theme.text, marginBottom: 8 }}>Delete Model?</div>
+                <div style={{ fontSize: 13, color: theme.textMuted, marginBottom: 8 }}>
+                  <strong style={{ color: theme.text }}>{deletingModel.name}</strong>
+                </div>
+                <div style={{ fontSize: 11, color: theme.textDim, fontFamily: "monospace", marginBottom: 20, padding: "6px 12px", background: theme.bgInput, borderRadius: 6, display: "inline-block" }}>
+                  {deletingModel.id}
+                </div>
+                {!deletingModel.custom && (
+                  <div style={{ padding: "8px 14px", background: theme.warningBg, border: `1px solid ${theme.warning}44`, borderRadius: 8, marginBottom: 20, fontSize: 12, color: theme.warning }}>
+                    ⚠️ This is a built-in model. Deleting it will also remove it from all routing tiers.
+                  </div>
+                )}
+                <div style={{ display: "flex", gap: 10 }}>
+                  <Button variant="ghost" onClick={() => setDeletingModel(null)} style={{ flex: 1 }}>Cancel</Button>
+                  <Button variant="danger" onClick={() => handleDeleteModel(deletingModel.id)} style={{ flex: 1 }}>Delete</Button>
+                </div>
+              </div>
+            </div>
+          )}
         </div>
       )}
 
@@ -956,9 +1192,216 @@ const LLMSettingsPage = ({ onBack }) => {
           </div>
         </div>
       )}
+
+      {/* ── USAGE & LIMITS TAB ── */}
+      {tab === "usage" && (
+        <div style={{ display: "flex", flexDirection: "column", gap: 28 }}>
+
+          {/* Per-Model Limits Editor */}
+          <div>
+            <SectionHeader
+              title="Per-Model Rate Limits"
+              subtitle="Set RPM, per-request token cap, tokens-per-minute & daily budgets. 0 = unlimited. Auto-switches to fallback model when any limit is hit."
+            />
+            <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+              {limitsData.length === 0 && (
+                <div style={{ padding: 32, textAlign: "center", color: theme.textDim, fontSize: 13 }}>
+                  Loading... (make sure the API is running)
+                </div>
+              )}
+              {limitsData.map(model => {
+                const lim = editLimits[model.id] || { rpm_limit: 0, max_input_tokens: 0, max_tokens_per_minute: 0, max_tokens_per_day: 0 };
+                const isSaving = savingLimits[model.id];
+                const liveStats = model.live_stats || {};
+                const usage = model.usage || {};
+                const perMin = usage.per_minute || {};
+                const perDay = usage.per_day || {};
+                const perWeek = usage.per_week || {};
+                const rpmUsedPct = lim.rpm_limit > 0 ? Math.min(100, (liveStats.rpm_current || 0) / lim.rpm_limit * 100) : 0;
+                const rpmColor = rpmUsedPct > 85 ? theme.error : rpmUsedPct > 60 ? theme.warning : theme.success;
+
+                const handleLimitChange = (field, val) => {
+                  setEditLimits(prev => ({ ...prev, [model.id]: { ...lim, [field]: Math.max(0, parseInt(val) || 0) } }));
+                };
+
+                const handleSaveLimits = async () => {
+                  setSavingLimits(prev => ({ ...prev, [model.id]: true }));
+                  try {
+                    await api.setModelLimits(model.id, lim);
+                    showToast(`Limits saved for ${model.name || model.id}`);
+                    loadUsage();
+                  } catch { showToast("Failed to save limits", "error"); }
+                  finally { setSavingLimits(prev => ({ ...prev, [model.id]: false })); }
+                };
+
+                return (
+                  <Card key={model.id} style={{ padding: 0, overflow: "hidden" }}>
+                    <div style={{ padding: "12px 16px", display: "flex", alignItems: "center", gap: 12, borderBottom: `1px solid ${theme.border}` }}>
+                      <div style={{ width: 8, height: 8, borderRadius: "50%", background: model.enabled ? theme.success : theme.textDim, flexShrink: 0 }} />
+                      <div style={{ flex: 1 }}>
+                        <div style={{ fontSize: 13, fontWeight: 700, color: theme.text }}>{model.name || model.id}</div>
+                        <div style={{ fontSize: 10, color: theme.textDim, fontFamily: "monospace" }}>{model.id}</div>
+                      </div>
+                      {lim.rpm_limit > 0 && (
+                        <div style={{ textAlign: "right" }}>
+                          <div style={{ fontSize: 10, color: theme.textMuted }}>Live RPM</div>
+                          <div style={{ fontSize: 16, fontWeight: 800, color: rpmColor }}>{liveStats.rpm_current || 0}/{lim.rpm_limit}</div>
+                          <div style={{ width: 72, height: 4, background: theme.border, borderRadius: 2, marginTop: 2 }}>
+                            <div style={{ width: `${rpmUsedPct}%`, height: "100%", borderRadius: 2, background: rpmColor, transition: "width 0.5s" }} />
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                    <div style={{ padding: 16 }}>
+                      <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 12, marginBottom: 14 }}>
+                        {[
+                          { field: "rpm_limit", label: "Max RPM", hint: "requests / min" },
+                          { field: "max_input_tokens", label: "Max Input Tokens", hint: "per request" },
+                          { field: "max_tokens_per_minute", label: "Token Budget / Min", hint: "in + out tokens" },
+                          { field: "max_tokens_per_day", label: "Daily Token Budget", hint: "in + out tokens" },
+                        ].map(({ field, label, hint }) => (
+                          <div key={field}>
+                            <div style={{ fontSize: 10, fontWeight: 700, color: theme.textMuted, textTransform: "uppercase", letterSpacing: "0.5px", marginBottom: 3 }}>{label}</div>
+                            <div style={{ fontSize: 9, color: theme.textDim, marginBottom: 5 }}>{hint} — 0 = unlimited</div>
+                            <input
+                              type="number" min="0"
+                              value={lim[field] || 0}
+                              onChange={e => handleLimitChange(field, e.target.value)}
+                              style={{ width: "100%", padding: "8px 10px", background: theme.bgInput, border: `1px solid ${theme.border}`, borderRadius: 6, color: theme.text, fontSize: 14, fontWeight: 600, outline: "none", boxSizing: "border-box" }}
+                              onFocus={e => e.target.style.borderColor = theme.accent}
+                              onBlur={e => e.target.style.borderColor = theme.border}
+                            />
+                          </div>
+                        ))}
+                      </div>
+                      {((perMin.requests || 0) + (perDay.requests || 0)) > 0 && (
+                        <div style={{ display: "flex", gap: 12, marginBottom: 14, padding: "10px 12px", background: theme.bgInput, borderRadius: 8 }}>
+                          {[
+                            { label: "Requests (min)", val: perMin.requests || 0, max: lim.rpm_limit },
+                            { label: "Tokens (min)", val: (perMin.input_tokens || 0) + (perMin.output_tokens || 0), max: lim.max_tokens_per_minute },
+                            { label: "Tokens (day)", val: (perDay.input_tokens || 0) + (perDay.output_tokens || 0), max: lim.max_tokens_per_day },
+                            { label: "Tokens (week)", val: (perWeek.input_tokens || 0) + (perWeek.output_tokens || 0), max: 0 },
+                          ].map(({ label, val, max }) => {
+                            const pct = max > 0 ? Math.min(100, val / max * 100) : 0;
+                            const barColor = pct > 90 ? theme.error : pct > 70 ? theme.warning : theme.accent;
+                            return (
+                              <div key={label} style={{ flex: 1 }}>
+                                <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 3 }}>
+                                  <span style={{ fontSize: 10, color: theme.textDim }}>{label}</span>
+                                  <span style={{ fontSize: 10, fontWeight: 600, color: max > 0 && pct > 80 ? theme.error : theme.textMuted }}>
+                                    {val > 999 ? `${(val / 1000).toFixed(1)}K` : val}
+                                    {max > 0 ? ` / ${max > 999 ? `${(max / 1000).toFixed(0)}K` : max}` : ""}
+                                  </span>
+                                </div>
+                                <div style={{ height: 4, background: theme.border, borderRadius: 2 }}>
+                                  {max > 0 && <div style={{ width: `${pct}%`, height: "100%", background: barColor, borderRadius: 2, transition: "width 0.4s" }} />}
+                                </div>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      )}
+                      <div style={{ display: "flex", justifyContent: "flex-end" }}>
+                        <Button onClick={handleSaveLimits} disabled={isSaving} style={{ padding: "7px 18px", fontSize: 12 }}>
+                          {isSaving ? "Saving..." : "💾 Save Limits"}
+                        </Button>
+                      </div>
+                    </div>
+                  </Card>
+                );
+              })}
+            </div>
+          </div>
+
+          {/* Failover Event Log */}
+          <div>
+            <SectionHeader
+              title="⚡ Failover Events"
+              subtitle="Auto model-switches triggered by rate limits or failures. Full context window is forwarded to replacement model."
+              action={<Button variant="ghost" onClick={loadUsage} style={{ padding: "5px 12px", fontSize: 11 }}>↻ Refresh</Button>}
+            />
+            {failoverEvents.length === 0 ? (
+              <Card style={{ textAlign: "center", padding: 32, color: theme.textDim }}>
+                <div style={{ fontSize: 28, marginBottom: 8 }}>✅</div>
+                <div style={{ fontSize: 14, fontWeight: 600, color: theme.textMuted }}>No failovers recorded</div>
+                <div style={{ fontSize: 12, color: theme.textDim, marginTop: 4 }}>All models operating within limits</div>
+              </Card>
+            ) : (
+              <div style={{ display: "flex", flexDirection: "column", gap: 5 }}>
+                {failoverEvents.map((ev, i) => {
+                  const reasonColor = ev.reason.includes("rpm") ? theme.warning : ev.reason.includes("token") ? theme.info : theme.error;
+                  const reasonLabel = { rpm_limit: "RPM Limit", token_limit: "Token Budget", api_error: "API Error", timeout: "Timeout", unavailable: "Unavailable", fallback_success: "Fallback OK", token_per_minute_limit: "TPM Limit", token_per_day_limit: "Day Budget" }[ev.reason] || ev.reason;
+                  const agoStr = ev.ago_seconds < 60 ? `${ev.ago_seconds}s ago` : ev.ago_seconds < 3600 ? `${Math.round(ev.ago_seconds / 60)}m ago` : new Date(ev.timestamp * 1000).toLocaleTimeString();
+                  return (
+                    <div key={i} style={{ display: "flex", alignItems: "center", gap: 10, padding: "10px 14px", background: theme.bgCard, border: `1px solid ${theme.border}`, borderLeft: `3px solid ${reasonColor}`, borderRadius: "0 8px 8px 0" }}>
+                      <div style={{ fontSize: 10, color: theme.textDim, minWidth: 56, fontFamily: "monospace" }}>{agoStr}</div>
+                      <div style={{ fontSize: 11, color: theme.textMuted, fontFamily: "monospace", maxWidth: 180, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{ev.from_model.split("/").pop()}</div>
+                      <span style={{ fontSize: 14, color: reasonColor }}>→</span>
+                      <div style={{ fontSize: 11, color: theme.accent, fontFamily: "monospace", maxWidth: 180, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{ev.to_model.split("/").pop()}</div>
+                      <span style={{ padding: "2px 7px", borderRadius: 4, fontSize: 10, fontWeight: 700, background: `${reasonColor}22`, color: reasonColor, textTransform: "uppercase", flexShrink: 0 }}>{reasonLabel}</span>
+                      <span style={{ fontSize: 10, color: theme.textDim, marginLeft: "auto", flexShrink: 0 }}>~{ev.context_tokens > 999 ? `${(ev.context_tokens / 1000).toFixed(1)}K` : ev.context_tokens} ctx</span>
+                      {ev.task_hint && <span style={{ fontSize: 10, color: theme.textDim, maxWidth: 140, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={ev.task_hint}>"{ev.task_hint}"</span>}
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+
+          {/* Global Usage Summary */}
+          {usageData.filter(m => (m.usage.total.requests > 0)).length > 0 && (
+            <div>
+              <SectionHeader title="📈 Usage Summary" subtitle="Aggregated token usage across all models" />
+              <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(260px, 1fr))", gap: 12 }}>
+                {usageData.filter(m => (m.usage.total.requests > 0)).map(m => (
+                  <Card key={m.model_id} style={{ padding: 14 }}>
+                    <div style={{ fontSize: 12, fontWeight: 700, color: theme.text, marginBottom: 10, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{m.model_id.split("/").pop()}</div>
+                    {[{ label: "Last Min", d: m.usage.per_minute }, { label: "Today", d: m.usage.per_day }, { label: "This Week", d: m.usage.per_week }].map(({ label, d }) => (
+                      <div key={label} style={{ display: "flex", justifyContent: "space-between", marginBottom: 5, paddingBottom: 5, borderBottom: `1px solid ${theme.border}` }}>
+                        <span style={{ fontSize: 11, color: theme.textDim }}>{label}</span>
+                        <div>
+                          <span style={{ fontSize: 12, fontWeight: 600, color: theme.text }}>{((d.input_tokens || 0) + (d.output_tokens || 0)).toLocaleString()}</span>
+                          <span style={{ fontSize: 10, color: theme.textDim, marginLeft: 3 }}>tok</span>
+                          <span style={{ fontSize: 10, color: theme.textDim, marginLeft: 8 }}>{d.requests || 0} req</span>
+                          {(d.failures || 0) > 0 && <span style={{ fontSize: 10, color: theme.error, marginLeft: 6 }}>{d.failures} fail</span>}
+                        </div>
+                      </div>
+                    ))}
+                    <div style={{ display: "flex", gap: 10, marginTop: 8 }}>
+                      {[
+                        { val: m.usage.total.requests, label: "Calls", color: theme.accent },
+                        { val: (m.usage.total.input_tokens || 0) + (m.usage.total.output_tokens || 0), label: "Tokens", color: theme.info, short: true },
+                        { val: m.usage.total.failures || 0, label: "Failures", color: theme.error },
+                      ].map(({ val, label, color, short }) => (
+                        <div key={label} style={{ flex: 1, textAlign: "center" }}>
+                          <div style={{ fontSize: 15, fontWeight: 800, color }}>{short && val > 999 ? `${(val / 1000).toFixed(1)}K` : val}</div>
+                          <div style={{ fontSize: 9, color: theme.textDim, textTransform: "uppercase" }}>{label}</div>
+                        </div>
+                      ))}
+                    </div>
+                  </Card>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* Info box */}
+          <div style={{ padding: 16, background: theme.bgCard, border: `1px solid ${theme.border}`, borderRadius: 10 }}>
+            <div style={{ fontSize: 12, color: theme.textMuted, lineHeight: 1.8 }}>
+              <strong style={{ color: theme.text }}>How smart failover works:</strong><br />
+              1. Every LLM call checks the model's RPM window and token budgets <em>before</em> sending — no wasted requests.<br />
+              2. If a limit would be exceeded, the call is instantly routed to the next model in the fallback chain.<br />
+              3. The <strong style={{ color: theme.text }}>full message history</strong> (context window) is forwarded to the replacement model — it picks up exactly where the previous one left off.<br />
+              4. API failures (rate-limit errors, timeouts, unavailability) also trigger seamless failover.<br />
+              5. All events are logged above in real-time with context size, reason, and task description.
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 };
+
 
 // Sub-component for adding a model to a tier
 const AddModelToTier = ({ tier, models, existing, onAdd }) => {
