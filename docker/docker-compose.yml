@@ -1,0 +1,51 @@
+version: "3.9"
+
+services:
+  # ── FORGE API Server ──
+  forge-api:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      - FORGE_ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - FORGE_OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - FORGE_GOOGLE_API_KEY=${GOOGLE_API_KEY:-}
+      - FORGE_REDIS_URL=redis://redis:6379/0
+      - FORGE_DATABASE_URL=sqlite+aiosqlite:///./forge.db
+      - FORGE_DEBUG=true
+      - FORGE_MAX_PARALLEL_AGENTS=5
+    volumes:
+      - forge-workspaces:/root/.forge/workspaces
+      - ../forge_core:/app/forge_core
+      - ../api:/app/api
+    depends_on:
+      - redis
+    restart: unless-stopped
+
+  # ── Redis (task queue & caching) ──
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    restart: unless-stopped
+
+  # ── Dashboard (React frontend) ──
+  dashboard:
+    build:
+      context: ../dashboard
+      dockerfile: Dockerfile
+    ports:
+      - "3000:3000"
+    environment:
+      - VITE_API_URL=http://localhost:8000
+    depends_on:
+      - forge-api
+    restart: unless-stopped
+
+volumes:
+  forge-workspaces:
+  redis-data:
