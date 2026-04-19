@@ -99,15 +99,39 @@ class WorkspaceManager:
         for filepath, content in files.items():
             self.write_file(filepath, content, branch)
 
+    def _load_from_disk(self):
+        """Scan the workspace root on disk and populate the main branch."""
+        if not self.root.exists():
+            return
+        for file_path in self.root.rglob("*"):
+            if file_path.is_file():
+                rel = file_path.relative_to(self.root).as_posix()
+                try:
+                    content = file_path.read_text(encoding="utf-8", errors="replace")
+                    self._branches["main"][rel] = content
+                except Exception as exc:
+                    logger.debug(f"Skipping unreadable file {rel}: {exc}")
+        logger.info(f"[workspace] Loaded {len(self._branches['main'])} files from disk for {self.project_id}")
+
     def get_all_files(self, branch: Optional[str] = None) -> dict[str, str]:
-        """Get all files on a branch."""
+        """Get all files on a branch. Lazy-loads from disk if in-memory is empty."""
         target_branch = branch or self._current_branch
-        return dict(self._branches.get(target_branch, {}))
+        mem = self._branches.get(target_branch, {})
+        if not mem and target_branch == "main":
+            self._load_from_disk()
+            mem = self._branches.get("main", {})
+        return dict(mem)
 
     def get_file_list(self, branch: Optional[str] = None) -> list[str]:
         """Get list of all file paths on a branch."""
-        target_branch = branch or self._current_branch
-        return list(self._branches.get(target_branch, {}).keys())
+        return list(self.get_all_files(branch).keys())
+
+    def delete_workspace(self):
+        """Permanently delete all files from disk for this project."""
+        import shutil
+        if self.root.exists():
+            shutil.rmtree(self.root, ignore_errors=True)
+            logger.info(f"Deleted workspace at {self.root}")
 
     def get_context_files(self, filepaths: list[str], branch: Optional[str] = None) -> dict[str, str]:
         """Get contents of specific files for agent context."""

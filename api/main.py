@@ -586,6 +586,15 @@ async def list_projects():
     ]
 
 
+@app.delete("/api/projects/{project_id}")
+async def delete_project(project_id: str, delete_files: bool = False):
+    """Delete a project and optionally its generated workspace files."""
+    ok = await orchestrator.delete_project(project_id, delete_files=delete_files)
+    if not ok:
+        raise HTTPException(404, "Project not found")
+    return {"message": f"Project {project_id} deleted", "files_deleted": delete_files}
+
+
 @app.get("/api/projects/{project_id}")
 async def get_project(project_id: str):
     """Get detailed project info."""
@@ -601,9 +610,10 @@ async def get_project(project_id: str):
 @app.get("/api/projects/{project_id}/files")
 async def get_project_files(project_id: str):
     """Get all generated files for a project."""
+    project = orchestrator.get_project(project_id)
+    if not project:
+        raise HTTPException(404, "Project not found")
     files = orchestrator.get_project_files(project_id)
-    if not files:
-        raise HTTPException(404, "No files found")
     return {"files": files, "count": len(files)}
 
 
@@ -696,6 +706,36 @@ async def rebuild_project(project_id: str):
         raise HTTPException(400, "Project does not have enough input data for a rebuild")
 
     return {"message": "Rebuild started", "project_id": project_id, "status": "building"}
+
+
+class BuildControlRequest(BaseModel):
+    action: str  # "pause" | "resume" | "cancel"
+
+
+@app.post("/api/projects/{project_id}/control")
+async def control_build(project_id: str, req: BuildControlRequest):
+    """Control a running build: pause, resume, or cancel."""
+    project = orchestrator.get_project(project_id)
+    if not project:
+        raise HTTPException(404, "Project not found")
+    try:
+        result = orchestrator.control_build(project_id, req.action)
+        return result
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
+@app.post("/api/projects/{project_id}/resume")
+async def resume_build(project_id: str):
+    """Resume a failed or interrupted build from stored inputs."""
+    project = orchestrator.get_project(project_id)
+    if not project:
+        raise HTTPException(404, "Project not found")
+    try:
+        asyncio.create_task(_run_resume_build(project_id))
+        return {"message": "Resuming build", "project_id": project_id}
+    except ValueError as e:
+        raise HTTPException(400, str(e))
 
 
 @app.post("/api/projects/{project_id}/build/upload")
@@ -1132,6 +1172,10 @@ async def _run_build_requirements(project_id: str, requirements: str):
         await orchestrator.build_from_requirements(project_id, requirements)
     except Exception as e:
         logger.error(f"Build failed for {project_id}: {e}", exc_info=True)
+        project = orchestrator.get_project(project_id)
+        if project and project.status not in [ProjectStatus.COMPLETED]:
+            project.status = ProjectStatus.FAILED
+            await storage.save_project(project)
         await event_bus.emit(project_id, "error", f"Build failed: {str(e)}")
 
 
@@ -1141,7 +1185,25 @@ async def _run_build_html(project_id: str, html_files: dict[str, str]):
         await orchestrator.build_from_html_mockups(project_id, html_files)
     except Exception as e:
         logger.error(f"Build failed for {project_id}: {e}", exc_info=True)
+        project = orchestrator.get_project(project_id)
+        if project and project.status not in [ProjectStatus.COMPLETED]:
+            project.status = ProjectStatus.FAILED
+            await storage.save_project(project)
         await event_bus.emit(project_id, "error", f"Build failed: {str(e)}")
+
+
+async def _run_resume_build(project_id: str):
+    """Background task for resuming a failed/cancelled build."""
+    try:
+        await orchestrator.resume_build(project_id)
+    except Exception as e:
+        logger.error(f"Resume failed for {project_id}: {e}", exc_info=True)
+        project = orchestrator.get_project(project_id)
+        if project:
+            project.status = ProjectStatus.FAILED
+            await storage.save_project(project)
+        await event_bus.emit(project_id, "error", f"Resume failed: {str(e)}")
+
 
 
 # ──────────────────────────────────────────────

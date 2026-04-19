@@ -65,9 +65,9 @@ class Settings(BaseSettings):
     debug: bool = False
     base_dir: Path = Field(default_factory=lambda: Path(__file__).parent.parent)
 
-    # --- API ---
+    # --- Server ---
     api_host: str = "0.0.0.0"
-    api_port: int = 8000
+    api_port: int = 8010
     api_cors_origins: list[str] = ["*"]
 
     # --- LLM API Keys ---

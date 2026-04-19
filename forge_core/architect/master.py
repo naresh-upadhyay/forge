@@ -66,7 +66,7 @@ class MasterArchitect:
         self.fixer = FixerAgent()
         self.integration_checker = IntegrationCheckerAgent()
 
-    async def build_project(self, project: Project) -> Project:
+    async def build_project(self, project: Project, build_controls: dict | None = None) -> Project:
         """
         Execute the full build pipeline for a project.
 
@@ -83,6 +83,7 @@ class MasterArchitect:
             # Initialize workspace
             workspace = WorkspaceManager(project.id, project.name)
             project.workspace_path = await workspace.initialize(project.tech_stack.value)
+            controls = build_controls or {}
 
             # ── PHASE 1: Blueprint should already be set ──
             if not project.blueprint:
@@ -119,6 +120,37 @@ class MasterArchitect:
                 project.current_wave = wave
                 wave_units = [wu for wu in project.work_units if wu.wave == wave]
 
+                # ── Check for cancel/pause between waves ──────────────────
+                signal = controls.get(project.id, "running")
+                if signal == "cancel_requested":
+                    controls[project.id] = "running"
+                    project.status = ProjectStatus.FAILED
+                    await event_bus.emit(
+                        project.id, "error",
+                        "Build cancelled by user.",
+                        agent=AgentRole.ARCHITECT,
+                    )
+                    return project
+                if signal == "pause_requested":
+                    controls[project.id] = "paused"
+                    await event_bus.emit(
+                        project.id, "info",
+                        "Build paused — waiting for resume signal...",
+                        agent=AgentRole.ARCHITECT,
+                    )
+                    # Wait until resumed or cancelled
+                    while controls.get(project.id) in ("paused", "pause_requested"):
+                        await asyncio.sleep(2)
+                    if controls.get(project.id) == "cancel_requested":
+                        project.status = ProjectStatus.FAILED
+                        await event_bus.emit(
+                            project.id, "error", "Build cancelled during pause.",
+                            agent=AgentRole.ARCHITECT,
+                        )
+                        return project
+                    await event_bus.emit(
+                        project.id, "info", "Build resumed.", agent=AgentRole.ARCHITECT,
+                    )
                 await event_bus.emit(
                     project.id, "status_change",
                     f"Wave {wave + 1}/{project.total_waves}: "
@@ -131,32 +163,34 @@ class MasterArchitect:
                 await self._execute_wave(wave_units, project, workspace)
 
             # ── PHASE 4: Integration Check ──
-            project.status = ProjectStatus.TESTING
-            await event_bus.emit(
-                project.id, "status_change",
-                "Running integration check...",
-                agent=AgentRole.ARCHITECT,
-            )
-
+            # (skip if no files were generated)
             all_files = workspace.get_all_files("main")
-            all_contracts = {}
-            for wu in project.work_units:
-                if wu.contracts:
-                    all_contracts[wu.title] = wu.contracts
-
-            integration_result = await self.integration_checker.check_integration(
-                all_files, all_contracts, project.id
-            )
-
-            # Handle integration issues
-            if not integration_result.get("passed", True):
-                issues = integration_result.get("issues", [])
+            if all_files:
+                project.status = ProjectStatus.TESTING
                 await event_bus.emit(
-                    project.id, "info",
-                    f"Integration issues found: {len(issues)}. Attempting fixes...",
+                    project.id, "status_change",
+                    "Running integration check...",
                     agent=AgentRole.ARCHITECT,
                 )
-                await self._fix_integration_issues(issues, project, workspace)
+
+                all_contracts = {}
+                for wu in project.work_units:
+                    if wu.contracts:
+                        all_contracts[wu.title] = wu.contracts
+
+                integration_result = await self.integration_checker.check_integration(
+                    all_files, all_contracts, project.id
+                )
+
+                # Guard against non-dict result from LLM
+                if isinstance(integration_result, dict) and not integration_result.get("passed", True):
+                    issues = integration_result.get("issues", [])
+                    await event_bus.emit(
+                        project.id, "info",
+                        f"Integration issues found: {len(issues)}. Attempting fixes...",
+                        agent=AgentRole.ARCHITECT,
+                    )
+                    await self._fix_integration_issues(issues, project, workspace)
 
             # ── PHASE 5: Complete ──
             project.status = ProjectStatus.COMPLETED
@@ -225,6 +259,9 @@ Return the JSON plan."""
 
         work_units = []
         for wu_data in work_units_data:
+            if not isinstance(wu_data, dict):
+                logger.warning(f"Skipping non-dict work unit: {wu_data!r}")
+                continue
             wu_type = self._parse_work_unit_type(wu_data.get("type", "service"))
             agent_role = WORK_TYPE_TO_AGENT.get(wu_type, AgentRole.BACKEND_BUILDER)
 
@@ -263,11 +300,48 @@ Return the JSON plan."""
 
         async def run_unit(wu: WorkUnit):
             async with semaphore:
-                await self._execute_single_unit(wu, project, workspace)
+                await self._execute_single_unit_with_timeout(wu, project, workspace)
 
-        # Run all units in the wave concurrently
         tasks = [run_unit(wu) for wu in wave_units]
         await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def _execute_single_unit_with_timeout(
+        self,
+        work_unit: WorkUnit,
+        project: Project,
+        workspace: WorkspaceManager,
+        timeout_seconds: int = 300,
+    ):
+        """Wrap _execute_single_unit with a watchdog timeout + one auto-retry."""
+        for attempt in range(2):  # 1 initial + 1 auto-retry
+            try:
+                await asyncio.wait_for(
+                    self._execute_single_unit(work_unit, project, workspace),
+                    timeout=timeout_seconds,
+                )
+                return  # Success
+            except asyncio.TimeoutError:
+                await event_bus.emit(
+                    project.id, "error",
+                    f"⚠ Watchdog: Work unit '{work_unit.title}' timed out after "
+                    f"{timeout_seconds}s {'— auto-retrying...' if attempt == 0 else '— marking failed.'}",
+                    agent=AgentRole.ARCHITECT,
+                    work_unit_id=work_unit.id,
+                )
+                logger.warning(
+                    f"Work unit '{work_unit.title}' timed out (attempt {attempt + 1}/2)"
+                )
+                if attempt == 0:
+                    # Reset for retry
+                    from forge_core.models import WorkUnitStatus
+                    work_unit.status = WorkUnitStatus.PENDING
+                    work_unit.started_at = None
+                else:
+                    from forge_core.models import WorkUnitStatus
+                    work_unit.status = WorkUnitStatus.FAILED
+            except Exception as exc:
+                logger.error(f"Unexpected error in work unit '{work_unit.title}': {exc}", exc_info=True)
+                return
 
     async def _execute_single_unit(
         self,

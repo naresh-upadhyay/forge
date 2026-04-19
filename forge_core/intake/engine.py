@@ -304,9 +304,16 @@ Identify:
         backend_stack: Optional[TechStack] = None,
     ) -> Blueprint:
         """Convert parsed JSON data into a Blueprint model."""
+        if not isinstance(data, dict):
+            logger.error(f"_build_blueprint received non-dict: {type(data)}. Using empty blueprint.")
+            data = {}
+
         # Build entities
         entities = []
         for e in data.get("entities", []):
+            if not isinstance(e, dict):
+                logger.warning(f"Skipping non-dict entity item: {e!r}")
+                continue
             fields = []
             for f in e.get("fields", []):
                 fields.append(EntityField(
@@ -330,6 +337,9 @@ Identify:
         # Build screens
         screens = []
         for s in data.get("screens", []):
+            if not isinstance(s, dict):
+                logger.warning(f"Skipping non-dict screen item: {s!r}")
+                continue
             components = self._parse_components(s.get("components", []))
             screens.append(Screen(
                 name=s.get("name", ""),
@@ -348,7 +358,7 @@ Identify:
                 description=f.get("description", ""),
                 steps=f.get("steps", []),
             )
-            for f in data.get("flows", [])
+            for f in data.get("flows", []) if isinstance(f, dict)
         ]
 
         # Build API endpoints
@@ -362,7 +372,7 @@ Identify:
                 auth_required=ep.get("auth_required", False),
                 related_entity=ep.get("related_entity"),
             )
-            for ep in data.get("api_endpoints", [])
+            for ep in data.get("api_endpoints", []) if isinstance(ep, dict)
         ]
 
         # Build business rules
@@ -374,7 +384,7 @@ Identify:
                 conditions=r.get("conditions", []),
                 actions=r.get("actions", []),
             )
-            for r in data.get("business_rules", [])
+            for r in data.get("business_rules", []) if isinstance(r, dict)
         ]
 
         return Blueprint(
@@ -394,6 +404,9 @@ Identify:
         """Recursively parse component data into UIComponent models."""
         result = []
         for c in components_data:
+            if not isinstance(c, dict):
+                logger.warning(f"Skipping non-dict component: {c!r}")
+                continue
             children = self._parse_components(c.get("children", []))
             result.append(UIComponent(
                 name=c.get("name", ""),

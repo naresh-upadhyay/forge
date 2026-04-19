@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useCallback } from "react";
+import React, { useState, useEffect, useRef, useCallback } from "react";
 
 const API_URL = import.meta.env.VITE_API_URL || "";
 
@@ -112,6 +112,27 @@ const api = {
     const r = await fetch(`${API_URL}/api/projects/${id}/rebuild`, { method: "POST" });
     return r.json();
   },
+  async deleteProject(id, deleteFiles = false) {
+    const r = await fetch(`${API_URL}/api/projects/${id}?delete_files=${deleteFiles}`, { method: "DELETE" });
+    return r.json();
+  },
+  async controlBuild(id, action) {
+    const r = await fetch(`${API_URL}/api/projects/${id}/control`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ action }),
+    });
+    return r.json();
+  },
+  async resumeBuild(id) {
+    const r = await fetch(`${API_URL}/api/projects/${id}/resume`, { method: "POST" });
+    return r.json();
+  },
+  async getFileContent(projectId, filePath) {
+    const r = await fetch(`${API_URL}/api/projects/${projectId}/file/${encodeURIComponent(filePath)}`);
+    return r.json();
+  },
+
   // LLM Config
   async getLLMProviders() {
     const r = await fetch(`${API_URL}/api/llm/providers`);
@@ -2082,15 +2103,190 @@ const CreateProjectPage = ({ onCreated, onCancel }) => {
 };
 
 // ──────────────────────────────────────────────
+// File Browser Component (tree + code viewer)
+// ──────────────────────────────────────────────
+
+const buildFileTree = (filePaths) => {
+  const root = {};
+  for (const fp of filePaths) {
+    const parts = fp.split("/");
+    let node = root;
+    for (let i = 0; i < parts.length - 1; i++) {
+      if (!node[parts[i]] || typeof node[parts[i]] === "string") {
+        node[parts[i]] = {};
+      }
+      node = node[parts[i]];
+    }
+    const fname = parts[parts.length - 1];
+    if (typeof node === "object" && node !== null) {
+      node[fname] = fp; // leaf = full path string
+    }
+  }
+  return root;
+};
+
+const FileTreeNode = ({ name, node, depth, selectedFile, onSelect }) => {
+  const isFile = typeof node === "string";
+  const [open, setOpen] = useState(depth < 2);
+  const indent = depth * 14;
+  if (isFile) {
+    const sel = selectedFile === node;
+    return (
+      <div
+        onClick={() => onSelect(node)}
+        title={node}
+        style={{
+          paddingLeft: indent + 8, paddingRight: 8, paddingTop: 4, paddingBottom: 4,
+          fontSize: 11.5, cursor: "pointer", borderRadius: 4,
+          color: sel ? theme.accent : theme.textMuted,
+          background: sel ? theme.accentGlow : "transparent",
+          fontFamily: "'JetBrains Mono', monospace",
+          whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis",
+          transition: "all 0.15s",
+        }}
+        onMouseEnter={e => { if (!sel) e.currentTarget.style.color = theme.text; }}
+        onMouseLeave={e => { if (!sel) e.currentTarget.style.color = theme.textMuted; }}
+      >
+        📄 {name}
+      </div>
+    );
+  }
+  return (
+    <div>
+      <div
+        onClick={() => setOpen(o => !o)}
+        style={{
+          paddingLeft: indent + 4, paddingRight: 8, paddingTop: 5, paddingBottom: 5,
+          fontSize: 11.5, cursor: "pointer", display: "flex", alignItems: "center", gap: 4,
+          color: theme.textMuted, userSelect: "none",
+          transition: "color 0.15s",
+        }}
+        onMouseEnter={e => e.currentTarget.style.color = theme.text}
+        onMouseLeave={e => e.currentTarget.style.color = theme.textMuted}
+      >
+        <span style={{ fontSize: 9 }}>{open ? "▾" : "▸"}</span>
+        <span style={{ fontWeight: 600 }}>📁 {name}</span>
+      </div>
+      {open && Object.entries(node).sort(([a, av], [b, bv]) => {
+        const aDir = typeof av !== "string"; const bDir = typeof bv !== "string";
+        if (aDir !== bDir) return aDir ? -1 : 1;
+        return a.localeCompare(b);
+      }).map(([childName, childNode]) => (
+        <FileTreeNode key={childName} name={childName} node={childNode} depth={depth + 1} selectedFile={selectedFile} onSelect={onSelect} />
+      ))}
+    </div>
+  );
+};
+
+const getLanguageHint = (path) => {
+  const ext = path.split(".").pop().toLowerCase();
+  const map = { dart: "Dart", py: "Python", js: "JavaScript", jsx: "JSX", ts: "TypeScript", tsx: "TSX", json: "JSON", yaml: "YAML", yml: "YAML", html: "HTML", css: "CSS", md: "Markdown", txt: "Text", xml: "XML", sql: "SQL", sh: "Shell", env: "ENV" };
+  return map[ext] || ext.toUpperCase();
+};
+
+class ErrorBoundary extends React.Component {
+  constructor(props) { super(props); this.state = { hasError: false, error: null }; }
+  static getDerivedStateFromError(error) { return { hasError: true, error }; }
+  render() {
+    if (this.state.hasError) {
+      return <div style={{padding: 20, color: "red", background: "#330000"}}><h1>UI Crash</h1><pre>{this.state.error?.toString()}{"\n"}{this.state.error?.stack}</pre></div>;
+    }
+    return this.props.children;
+  }
+}
+
+const FileBrowserTabContent = ({ files }) => {
+  // Defensive: ensure files is always a plain object
+  const safeFiles = (files && typeof files === "object" && !Array.isArray(files)) ? files : {};
+  const [selectedFile, setSelectedFile] = useState(null);
+  const filePaths = Object.keys(safeFiles).sort();
+  const tree = buildFileTree(filePaths);
+  const fileCount = filePaths.length;
+
+  // Auto-select first file
+  React.useEffect(() => {
+    if (fileCount > 0 && !selectedFile) setSelectedFile(filePaths[0]);
+  }, [fileCount]);
+
+  if (fileCount === 0) {
+    return (
+      <Card style={{ padding: 40, textAlign: "center" }}>
+        <div style={{ fontSize: 36, marginBottom: 12 }}>📂</div>
+        <div style={{ color: theme.textMuted, fontSize: 14 }}>No files generated yet</div>
+        <div style={{ color: theme.textDim, fontSize: 12, marginTop: 4 }}>Start a build to see generated code here</div>
+      </Card>
+    );
+  }
+
+  return (
+    <div style={{ display: "grid", gridTemplateColumns: "260px 1fr", gap: 12, minHeight: 480 }}>
+      {/* File Tree */}
+      <Card style={{ padding: "8px 4px", overflowY: "auto", maxHeight: 520 }}>
+        <div style={{ fontSize: 10, fontWeight: 700, color: theme.textDim, textTransform: "uppercase", letterSpacing: "0.5px", padding: "4px 12px 8px" }}>
+          {fileCount} file{fileCount !== 1 ? "s" : ""}
+        </div>
+        {Object.entries(tree).sort(([a, av], [b, bv]) => {
+          const aDir = typeof av !== "string"; const bDir = typeof bv !== "string";
+          if (aDir !== bDir) return aDir ? -1 : 1;
+          return a.localeCompare(b);
+        }).map(([name, node]) => (
+          <FileTreeNode key={name} name={name} node={node} depth={0} selectedFile={selectedFile} onSelect={setSelectedFile} />
+        ))}
+      </Card>
+
+      {/* Code Viewer */}
+      <Card style={{ padding: 0, overflow: "hidden", display: "flex", flexDirection: "column" }}>
+        {selectedFile ? (
+          <>
+            <div style={{
+              padding: "8px 14px", borderBottom: `1px solid ${theme.border}`,
+              display: "flex", alignItems: "center", justifyContent: "space-between",
+              background: theme.bgHover, flexShrink: 0,
+            }}>
+              <span style={{ fontSize: 12, color: theme.textMuted, fontFamily: "monospace", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                {selectedFile}
+              </span>
+              <span style={{ fontSize: 10, color: theme.accent, fontWeight: 700, background: theme.accentGlow, padding: "2px 8px", borderRadius: 4, flexShrink: 0, marginLeft: 8 }}>
+                {getLanguageHint(selectedFile)}
+              </span>
+            </div>
+            <pre style={{
+              padding: "14px 16px", margin: 0, fontSize: 12,
+              color: theme.text, fontFamily: "'JetBrains Mono', 'Fira Code', monospace",
+              lineHeight: 1.65, overflowX: "auto", overflowY: "auto",
+              flex: 1, maxHeight: 470, whiteSpace: "pre", wordBreak: "normal",
+            }}>
+              {safeFiles[selectedFile] || ""}
+            </pre>
+          </>
+        ) : (
+          <div style={{ padding: 40, textAlign: "center", color: theme.textDim, flex: 1, display: "flex", alignItems: "center", justifyContent: "center" }}>
+            Select a file from the tree to view its contents
+          </div>
+        )}
+      </Card>
+    </div>
+  );
+};
+
+const FileBrowserTab = (props) => (
+  <ErrorBoundary>
+    <FileBrowserTabContent {...props} />
+  </ErrorBoundary>
+);
+
+
+// ──────────────────────────────────────────────
+
 // Project Detail / Build Monitor Page
 // ──────────────────────────────────────────────
 
 const ProjectDetailPage = ({ projectId, onBack }) => {
+
   const [project, setProject] = useState(null);
   const [events, setEvents] = useState([]);
   const [workUnits, setWorkUnits] = useState([]);
   const [files, setFiles] = useState({});
-  const [selectedFile, setSelectedFile] = useState(null);
   const [tab, setTab] = useState("live");
   const [feedback, setFeedback] = useState("");
   const [feedbackSending, setFeedbackSending] = useState(false);
@@ -2103,11 +2299,17 @@ const ProjectDetailPage = ({ projectId, onBack }) => {
       try {
         const p = await api.getProject(projectId);
         setProject(p);
-        if (p.status === "completed" || p.status === "failed") {
-          try {
-            const f = await api.getFiles(projectId);
-            setFiles(f.files || {});
-          } catch {}
+        // Always try to fetch files (disk-backed now works even after restart)
+        try {
+          const f = await api.getFiles(projectId);
+          // Guard: only use .files if it's a plain object, otherwise keep empty
+          if (f && typeof f.files === "object" && f.files !== null && !Array.isArray(f.files)) {
+            setFiles(f.files);
+          } else {
+            setFiles({});
+          }
+        } catch {
+          setFiles({});
         }
         try {
           const wu = await api.getWorkUnits(projectId);
@@ -2152,8 +2354,10 @@ const ProjectDetailPage = ({ projectId, onBack }) => {
   }, [projectId]);
 
   useEffect(() => {
-    eventsEndRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [events]);
+    if (tab === "live" && events.length > 1) {
+      eventsEndRef.current?.scrollIntoView({ behavior: "smooth" });
+    }
+  }, [events, tab]);
 
   const handleFeedback = async () => {
     if (!feedback.trim()) return;
@@ -2176,6 +2380,9 @@ const ProjectDetailPage = ({ projectId, onBack }) => {
     );
   }
 
+  const ACTIVE_STATUSES = ["analyzing", "planning", "building", "reviewing", "testing", "fixing"];
+  const CAN_RESUME = project.status === "failed" && (project.input_text || (project.input_mockups && Object.keys(project.input_mockups).length > 0));
+
   const tabs = [
     { id: "live", label: "Live Feed" },
     { id: "units", label: `Work Units (${workUnits.length})` },
@@ -2189,7 +2396,48 @@ const ProjectDetailPage = ({ projectId, onBack }) => {
       <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 8 }}>
         <button onClick={onBack} style={{ background: "none", border: "none", color: theme.textMuted, cursor: "pointer", fontSize: 18 }}>←</button>
         <h1 style={{ fontSize: 22, fontWeight: 700, color: theme.text, margin: 0, flex: 1 }}>{project.name}</h1>
-        {project.status === "failed" && (
+
+        {/* Build controls for active builds */}
+        {ACTIVE_STATUSES.includes(project.status) && (
+          <div style={{ display: "flex", gap: 6 }}>
+            <button
+              onClick={() => api.controlBuild(projectId, "pause")}
+              title="Pause build"
+              style={{ background: theme.warning + "22", border: `1px solid ${theme.warning}`, borderRadius: 6, color: theme.warning, padding: "4px 10px", fontSize: 13, cursor: "pointer", fontWeight: 700 }}
+            >⏸ Pause</button>
+            <button
+              onClick={() => api.controlBuild(projectId, "cancel")}
+              title="Cancel build"
+              style={{ background: theme.error + "22", border: `1px solid ${theme.error}`, borderRadius: 6, color: theme.error, padding: "4px 10px", fontSize: 13, cursor: "pointer", fontWeight: 700 }}
+            >⏹ Cancel</button>
+          </div>
+        )}
+
+        {/* Resume button for paused/cancelled builds */}
+        {project.status === "building" && (
+          <button
+            onClick={() => api.controlBuild(projectId, "resume")}
+            style={{ background: theme.success + "22", border: `1px solid ${theme.success}`, borderRadius: 6, color: theme.success, padding: "4px 10px", fontSize: 13, cursor: "pointer", fontWeight: 700 }}
+          >▶ Resume</button>
+        )}
+
+        {/* Resume after failure */}
+        {CAN_RESUME && (
+          <Button
+            variant="primary"
+            onClick={async () => {
+              try {
+                await api.resumeBuild(projectId);
+                setProject(prev => ({ ...prev, status: "analyzing" }));
+              } catch (e) { console.error(e); }
+            }}
+            style={{ padding: "6px 12px", fontSize: 12 }}
+          >
+            ▶ Resume Build
+          </Button>
+        )}
+
+        {project.status === "failed" && !CAN_RESUME && (
           <Button
             variant="primary"
             onClick={async () => {
@@ -2319,69 +2567,7 @@ const ProjectDetailPage = ({ projectId, onBack }) => {
       )}
 
       {tab === "files" && (
-        <div style={{ display: "grid", gridTemplateColumns: "240px 1fr", gap: 12, minHeight: 400 }}>
-          <Card style={{ padding: 8, overflowY: "auto", maxHeight: 500 }}>
-            {Object.keys(files).length === 0 ? (
-              <div style={{ padding: 20, textAlign: "center", color: theme.textDim, fontSize: 12 }}>
-                No files generated yet
-              </div>
-            ) : (
-              Object.keys(files).sort().map((fp) => (
-                <div
-                  key={fp}
-                  onClick={() => setSelectedFile(fp)}
-                  style={{
-                    padding: "6px 10px",
-                    fontSize: 12,
-                    color: selectedFile === fp ? theme.accent : theme.textMuted,
-                    background: selectedFile === fp ? theme.accentGlow : "transparent",
-                    borderRadius: 4,
-                    cursor: "pointer",
-                    fontFamily: "'JetBrains Mono', monospace",
-                    wordBreak: "break-all",
-                  }}
-                >
-                  {fp}
-                </div>
-              ))
-            )}
-          </Card>
-          <Card style={{ padding: 0, overflow: "hidden" }}>
-            {selectedFile ? (
-              <div>
-                <div style={{
-                  padding: "8px 14px",
-                  borderBottom: `1px solid ${theme.border}`,
-                  fontSize: 12,
-                  color: theme.textMuted,
-                  fontFamily: "monospace",
-                  background: theme.bgHover,
-                }}>
-                  {selectedFile}
-                </div>
-                <pre style={{
-                  padding: 14,
-                  margin: 0,
-                  fontSize: 12,
-                  color: theme.text,
-                  fontFamily: "'JetBrains Mono', 'Fira Code', monospace",
-                  lineHeight: 1.6,
-                  overflowX: "auto",
-                  maxHeight: 440,
-                  overflowY: "auto",
-                  whiteSpace: "pre-wrap",
-                  wordBreak: "break-word",
-                }}>
-                  {files[selectedFile]}
-                </pre>
-              </div>
-            ) : (
-              <div style={{ padding: 40, textAlign: "center", color: theme.textDim }}>
-                Select a file to view
-              </div>
-            )}
-          </Card>
-        </div>
+        <FileBrowserTab files={files} />
       )}
 
       {tab === "feedback" && (
@@ -2441,22 +2627,82 @@ const ProjectDetailPage = ({ projectId, onBack }) => {
 const HomePage = ({ onSelectProject, onNewProject, onSettings }) => {
   const [projects, setProjects] = useState([]);
   const [metrics, setMetrics] = useState({});
+  const [deletingId, setDeletingId] = useState(null);
+  const [deleteFilesToo, setDeleteFilesToo] = useState(false);
+  const [confirmDeleteId, setConfirmDeleteId] = useState(null);
+
+  const loadProjects = async () => {
+    try { setProjects(await api.listProjects()); } catch {}
+    try { setMetrics(await api.getMetrics()); } catch {}
+  };
 
   useEffect(() => {
-    const fetch = async () => {
-      try { setProjects(await api.listProjects()); } catch {}
-      try { setMetrics(await api.getMetrics()); } catch {}
-    };
-    fetch();
-    const i = setInterval(fetch, 5000);
+    loadProjects();
+    const i = setInterval(loadProjects, 5000);
     return () => clearInterval(i);
   }, []);
+
+  const handleDelete = async (e, id) => {
+    e.stopPropagation();
+    setConfirmDeleteId(id);
+  };
+
+  const confirmDelete = async () => {
+    setDeletingId(confirmDeleteId);
+    try {
+      await api.deleteProject(confirmDeleteId, deleteFilesToo);
+      setProjects(prev => prev.filter(p => p.id !== confirmDeleteId));
+    } catch (err) { console.error(err); }
+    setDeletingId(null);
+    setConfirmDeleteId(null);
+    setDeleteFilesToo(false);
+  };
 
   const totalCalls = Object.values(metrics).reduce((s, m) => s + (m.total_calls || 0), 0);
   const totalTokens = Object.values(metrics).reduce((s, m) => s + (m.total_input_tokens || 0) + (m.total_output_tokens || 0), 0);
 
+  const activeStatuses = ["analyzing", "planning", "building", "reviewing", "testing", "fixing"];
+
   return (
     <div style={{ maxWidth: 960, margin: "0 auto", padding: "40px 20px" }}>
+      {/* Delete Confirmation Modal */}
+      {confirmDeleteId && (
+        <div style={{
+          position: "fixed", inset: 0, background: "rgba(0,0,0,0.7)", zIndex: 9999,
+          display: "flex", alignItems: "center", justifyContent: "center",
+        }}>
+          <div style={{ background: theme.bgCard, border: `1px solid ${theme.border}`, borderRadius: 16, padding: 32, maxWidth: 400, width: "90%" }}>
+            <div style={{ fontSize: 18, fontWeight: 700, color: theme.text, marginBottom: 8 }}>Delete Project?</div>
+            <div style={{ fontSize: 13, color: theme.textMuted, marginBottom: 20 }}>
+              This will permanently remove the project from the database.
+            </div>
+            <label style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 24, cursor: "pointer" }}>
+              <input
+                type="checkbox"
+                checked={deleteFilesToo}
+                onChange={e => setDeleteFilesToo(e.target.checked)}
+                style={{ width: 16, height: 16, accentColor: theme.error }}
+              />
+              <span style={{ fontSize: 13, color: theme.text }}>Also delete generated files from disk</span>
+            </label>
+            <div style={{ display: "flex", gap: 10 }}>
+              <Button variant="ghost" onClick={() => { setConfirmDeleteId(null); setDeleteFilesToo(false); }} style={{ flex: 1 }}>Cancel</Button>
+              <button
+                onClick={confirmDelete}
+                disabled={deletingId !== null}
+                style={{
+                  flex: 1, padding: "10px 16px", borderRadius: 8, border: "none",
+                  background: theme.error, color: "#fff", fontWeight: 700, fontSize: 14,
+                  cursor: deletingId ? "wait" : "pointer", opacity: deletingId ? 0.7 : 1,
+                }}
+              >
+                {deletingId ? "Deleting..." : "Delete"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Hero */}
       <div style={{ textAlign: "center", marginBottom: 48 }}>
         <div style={{ display: "flex", justifyContent: "flex-end", marginBottom: 12 }}>
@@ -2465,18 +2711,10 @@ const HomePage = ({ onSelectProject, onNewProject, onSettings }) => {
             onClick={onSettings}
             title="LLM Model Settings"
             style={{
-              background: "none",
-              border: `1px solid ${theme.border}`,
-              borderRadius: 8,
-              color: theme.textMuted,
-              cursor: "pointer",
-              fontSize: 13,
-              fontWeight: 600,
-              padding: "7px 14px",
-              display: "flex",
-              alignItems: "center",
-              gap: 6,
-              transition: "all 0.2s",
+              background: "none", border: `1px solid ${theme.border}`,
+              borderRadius: 8, color: theme.textMuted, cursor: "pointer",
+              fontSize: 13, fontWeight: 600, padding: "7px 14px",
+              display: "flex", alignItems: "center", gap: 6, transition: "all 0.2s",
             }}
             onMouseEnter={e => { e.currentTarget.style.borderColor = theme.accent; e.currentTarget.style.color = theme.accent; }}
             onMouseLeave={e => { e.currentTarget.style.borderColor = theme.border; e.currentTarget.style.color = theme.textMuted; }}
@@ -2519,10 +2757,34 @@ const HomePage = ({ onSelectProject, onNewProject, onSettings }) => {
           </div>
           <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
             {projects.map((p) => (
-              <Card key={p.id} onClick={() => onSelectProject(p.id)} style={{ padding: 16 }}>
+              <Card
+                key={p.id}
+                onClick={() => onSelectProject(p.id)}
+                style={{ padding: 16, position: "relative", cursor: "pointer" }}
+              >
                 <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
-                  <span style={{ fontSize: 16, fontWeight: 700, color: theme.text }}>{p.name}</span>
-                  <StatusBadge status={p.status} />
+                  <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                    <span style={{ fontSize: 16, fontWeight: 700, color: theme.text }}>{p.name}</span>
+                    {activeStatuses.includes(p.status) && (
+                      <span style={{ fontSize: 10, color: theme.accent, animation: "pulse 1.5s infinite" }}>● LIVE</span>
+                    )}
+                  </div>
+                  <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                    <StatusBadge status={p.status} />
+                    <button
+                      onClick={e => handleDelete(e, p.id)}
+                      title="Delete project"
+                      style={{
+                        background: "none", border: "none", cursor: "pointer",
+                        color: theme.textDim, fontSize: 16, padding: "2px 6px",
+                        borderRadius: 4, transition: "color 0.2s",
+                      }}
+                      onMouseEnter={e => e.currentTarget.style.color = theme.error}
+                      onMouseLeave={e => e.currentTarget.style.color = theme.textDim}
+                    >
+                      🗑
+                    </button>
+                  </div>
                 </div>
                 <ProgressBar value={p.progress} />
                 <div style={{ display: "flex", justifyContent: "space-between", marginTop: 8, fontSize: 12, color: theme.textMuted }}>
@@ -2537,6 +2799,7 @@ const HomePage = ({ onSelectProject, onNewProject, onSettings }) => {
     </div>
   );
 };
+
 
 // ──────────────────────────────────────────────
 // App Root
