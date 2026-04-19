@@ -24,8 +24,10 @@ from forge_core.config import settings, MODEL_ROUTING, TaskComplexity, LLMModel
 from forge_core.events import event_bus
 from forge_core.llm.gateway import llm_gateway
 from forge_core.llm.rate_limiter import rate_limiter, ModelLimits
+from forge_core.llm.key_pool import key_pool
 from forge_core.models import BuildEvent, ProjectStatus
 from forge_core.orchestrator import orchestrator
+from forge_core.storage import storage, llm_config_storage
 
 logging.basicConfig(
     level=logging.INFO,
@@ -38,39 +40,59 @@ logger = logging.getLogger("forge.api")
 # Runtime LLM Config Store
 # ──────────────────────────────────────────────
 
+def _keys_from_env_key(provider_id: str, raw_key: str) -> list[dict]:
+    """Wrap a single raw API key string into the canonical key-list format."""
+    if not raw_key:
+        return []
+    return [{"label": "default", "key": raw_key}]
+
+
 class LLMConfigStore:
-    """In-memory runtime configuration for LLM providers, models and routing."""
+    """Runtime configuration for LLM providers, models and routing.
+
+    All mutations are immediately persisted to SQLite so the configuration
+    survives server restarts.  On startup `load_from_db()` is called to
+    restore the last-saved state before falling back to .env defaults.
+
+    Each provider stores a list of API keys (`api_keys`) instead of a
+    single `api_key`. The first non-rate-limited key in the list is always
+    the active one; rotation is handled by the `key_pool` singleton.
+    """
 
     def __init__(self):
+        # ── Bootstrap providers with keys from .env ──────────────────────────
+        def _make_provider(pid, name, raw_key, base_url, **extra):
+            keys = _keys_from_env_key(pid, raw_key)
+            return {
+                "id": pid,
+                "name": name,
+                "api_keys": keys,          # list of {label, key}
+                "base_url": base_url,
+                "enabled": bool(keys),
+                **extra,
+            }
+
         self._providers: dict[str, dict] = {
-            "openrouter": {
-                "id": "openrouter",
-                "name": "OpenRouter",
-                "api_key": settings.open_router_key or "",
-                "base_url": settings.open_base_url or "https://openrouter.ai/api/v1/",
-                "enabled": bool(settings.open_router_key),
-            },
-            "anthropic": {
-                "id": "anthropic",
-                "name": "Anthropic",
-                "api_key": settings.anthropic_api_key or "",
-                "base_url": "https://api.anthropic.com",
-                "enabled": bool(settings.anthropic_api_key),
-            },
-            "openai": {
-                "id": "openai",
-                "name": "OpenAI",
-                "api_key": settings.openai_api_key or "",
-                "base_url": "https://api.openai.com/v1",
-                "enabled": bool(settings.openai_api_key),
-            },
-            "google": {
-                "id": "google",
-                "name": "Google (Gemini)",
-                "api_key": settings.google_api_key or "",
-                "base_url": "https://generativelanguage.googleapis.com",
-                "enabled": bool(settings.google_api_key),
-            },
+            "openrouter": _make_provider(
+                "openrouter", "OpenRouter",
+                settings.open_router_key or "",
+                settings.open_base_url or "https://openrouter.ai/api/v1/",
+            ),
+            "anthropic": _make_provider(
+                "anthropic", "Anthropic",
+                settings.anthropic_api_key or "",
+                "https://api.anthropic.com",
+            ),
+            "openai": _make_provider(
+                "openai", "OpenAI",
+                settings.openai_api_key or "",
+                "https://api.openai.com/v1",
+            ),
+            "google": _make_provider(
+                "google", "Google (Gemini)",
+                settings.google_api_key or "",
+                "https://generativelanguage.googleapis.com",
+            ),
         }
 
         # Build default models list from LLMModel enum
@@ -97,6 +119,119 @@ class LLMConfigStore:
         for complexity, models in MODEL_ROUTING.items():
             self._routing[complexity.value] = [m.value for m in models]
 
+    # ── DB persistence ───────────────────────────────────────────────────────
+
+    async def load_from_db(self) -> None:
+        """Restore providers, keys, models, and routing from SQLite.
+
+        DB values OVERRIDE the .env defaults so that runtime changes
+        (e.g. extra keys added via the dashboard) are preserved across
+        restarts.
+        """
+        # ── Providers ────────────────────────────────────────────────────────
+        db_providers = await llm_config_storage.load_providers()
+        if db_providers:
+            for pid, p in db_providers.items():
+                if pid in self._providers:
+                    # Merge: keep .env fields as fallback but prefer DB values
+                    self._providers[pid].update(
+                        {k: v for k, v in p.items() if k != "api_keys"}
+                    )
+                else:
+                    self._providers[pid] = p
+
+        # ── Keys (includes persisted usage counters) ──────────────────────────
+        all_keys = await llm_config_storage.load_all_provider_keys()
+        for pid, key_rows in all_keys.items():
+            if pid not in self._providers:
+                continue
+            p = self._providers[pid]
+
+            # Merge: DB keys win; if a provider has no DB keys, keep .env key
+            if key_rows:
+                # Build a set of labels already in .env
+                env_labels = {k["label"] for k in p.get("api_keys", [])}
+                db_labels  = {k["label"] for k in key_rows}
+
+                # For keys present in BOTH: update the value in DB row from env
+                merged = []
+                for kr in key_rows:
+                    if kr["label"] in env_labels:
+                        # Prefer env key value (may have been rotated)
+                        env_key = next(
+                            (k["key"] for k in p["api_keys"] if k["label"] == kr["label"]),
+                            kr["key"],
+                        )
+                        kr = {**kr, "key": env_key}
+                    merged.append(kr)
+                # For keys only in .env (not yet saved): add them
+                for ek in p.get("api_keys", []):
+                    if ek["label"] not in db_labels:
+                        merged.append(ek)
+                p["api_keys"] = merged
+            # If no DB keys, keep what .env gave us (already set in __init__)
+
+        # ── Models ───────────────────────────────────────────────────────────
+        db_models = await llm_config_storage.load_models()
+        for mid, m in db_models.items():
+            if mid in self._models:
+                self._models[mid].update(m)
+            else:
+                self._models[mid] = m
+
+        # ── Routing ──────────────────────────────────────────────────────────
+        db_routing = await llm_config_storage.load_routing()
+        if db_routing:
+            self._routing.update(db_routing)
+
+        # ── Apply everything to key_pool + gateway ───────────────────────────
+        for pid, p in self._providers.items():
+            key_pool.init_provider(pid, p["api_keys"])
+        llm_gateway._configure_keys()
+
+        # Apply saved rate limits to the rate_limiter singleton
+        for m in self._models.values():
+            rpm = m.get("rpm_limit", 0)
+            max_in = m.get("max_input_tokens", 0)
+            tpm = m.get("max_tokens_per_minute", 0)
+            tpd = m.get("max_tokens_per_day", 0)
+            if any([rpm, max_in, tpm, tpd]):
+                rate_limiter.set_limits(m["id"], ModelLimits(
+                    rpm=rpm, max_input_tokens=max_in,
+                    max_tokens_per_minute=tpm, max_tokens_per_day=tpd,
+                ))
+
+        # Apply routing to gateway
+        new_routing = {}
+        for complexity in TaskComplexity:
+            tier_models = self._routing.get(complexity.value, [])
+            new_routing[complexity] = tier_models
+        llm_gateway._dynamic_routing = new_routing
+
+        logger.info("[LLMConfigStore] Configuration loaded from DB")
+
+    async def _persist_provider(self, provider_id: str) -> None:
+        """Save a single provider (no keys) to DB."""
+        p = self._providers.get(provider_id)
+        if p:
+            await llm_config_storage.save_provider(p)
+
+    async def _persist_key(
+        self, provider_id: str, label: str, api_key: str
+    ) -> None:
+        """Save a single key to DB (preserves existing usage counters)."""
+        await llm_config_storage.save_provider_key(provider_id, label, api_key)
+
+    async def _persist_model(self, model_id: str) -> None:
+        m = self._models.get(model_id)
+        if m:
+            await llm_config_storage.save_model(m)
+
+    async def _persist_routing(self) -> None:
+        await llm_config_storage.save_routing(self._routing)
+
+    # ── Provider API key helpers ─────────────────────────────────────────────
+
     def _detect_provider(self, model_id: str) -> str:
         if "claude" in model_id or "anthropic" in model_id:
             return "anthropic"
@@ -108,74 +243,181 @@ class LLMConfigStore:
             return "openrouter"
         return "openrouter"
 
-    def _apply_provider_env(self, provider_id: str):
-        """Apply a provider's credentials to environment variables for LiteLLM."""
-        p = self._providers[provider_id]
-        key = p.get("api_key", "")
+    def _sync_pool_and_env(self, provider_id: str):
+        """Push the current api_keys list for a provider into key_pool and refresh env."""
+        p = self._providers.get(provider_id, {})
+        keys = p.get("api_keys", [])
+        key_pool.init_provider(provider_id, keys)
         url = p.get("base_url", "")
-        if provider_id == "openrouter":
-            if key: os.environ["OPENROUTER_API_KEY"] = key
-            if url: os.environ["OPENROUTER_API_BASE"] = url
-        elif provider_id == "anthropic":
-            if key: os.environ["ANTHROPIC_API_KEY"] = key
-        elif provider_id == "openai":
-            if key: os.environ["OPENAI_API_KEY"] = key
-        elif provider_id == "google":
-            if key: os.environ["GEMINI_API_KEY"] = key
-        else:
-            # Custom provider: expose via per-provider env vars that LiteLLM
-            # can pick up when using openai-compatible format:
-            #   model = "openai/<model_name>"
-            #   OPENAI_API_KEY + OPENAI_API_BASE
-            # We namespace with the provider id so multiple customs don't clash.
+        if provider_id == "openrouter" and url:
+            os.environ["OPENROUTER_API_BASE"] = url
+        elif provider_id not in ("openrouter", "anthropic", "openai", "google"):
+            # Custom provider
             env_prefix = provider_id.upper().replace("-", "_")
-            if key: os.environ[f"{env_prefix}_API_KEY"] = key
-            if url: os.environ[f"{env_prefix}_API_BASE"] = url
+            if url:
+                os.environ[f"{env_prefix}_API_BASE"] = url
         llm_gateway._configure_keys()
 
-    # --- Providers ---
-    def get_providers(self) -> list[dict]:
-        return list(self._providers.values())
+    def get_provider_keys(self, provider_id: str) -> list[dict]:
+        """Return key statuses (masked) for the dashboard."""
+        if provider_id not in self._providers:
+            raise KeyError(f"Provider '{provider_id}' not found")
+        return key_pool.get_key_statuses(provider_id)
 
-    def add_provider(self, data: dict) -> dict:
+    async def add_provider_key(self, provider_id: str, label: str, api_key: str) -> dict:
+        """Add a new API key to a provider's pool."""
+        if provider_id not in self._providers:
+            raise KeyError(f"Provider '{provider_id}' not found")
+        p = self._providers[provider_id]
+        # Prevent label duplicates
+        existing_labels = {k["label"] for k in p["api_keys"]}
+        if label in existing_labels:
+            raise ValueError(f"Key with label '{label}' already exists for '{provider_id}'")
+        p["api_keys"].append({"label": label, "key": api_key})
+        p["enabled"] = True
+        key_pool.add_key(provider_id, label, api_key)
+        llm_gateway._configure_keys()
+        # Persist
+        await self._persist_provider(provider_id)
+        await self._persist_key(provider_id, label, api_key)
+        return {"label": label, "status": "active", "is_current": False}
+
+    async def delete_provider_key(self, provider_id: str, label: str) -> bool:
+        """Remove a key by label."""
+        if provider_id not in self._providers:
+            raise KeyError(f"Provider '{provider_id}' not found")
+        p = self._providers[provider_id]
+        before = len(p["api_keys"])
+        p["api_keys"] = [k for k in p["api_keys"] if k["label"] != label]
+        removed = len(p["api_keys"]) < before
+        if removed:
+            key_pool.remove_key(provider_id, label)
+            p["enabled"] = bool(p["api_keys"])
+            llm_gateway._configure_keys()
+            # Persist
+            await self._persist_provider(provider_id)
+            await llm_config_storage.delete_provider_key(provider_id, label)
+        return removed
+
+    def reset_provider_key(self, provider_id: str, label: str) -> bool:
+        """Clear rate-limit cooldown on a key."""
+        if provider_id not in self._providers:
+            raise KeyError(f"Provider '{provider_id}' not found")
+        return key_pool.reset_key(provider_id, label)
+
+    async def set_key_limits(
+        self,
+        provider_id: str,
+        label: str,
+        *,
+        daily_limit_tokens: int = 0,
+        monthly_limit_tokens: int = 0,
+    ) -> bool:
+        """Set daily/monthly token budget limits on a specific key."""
+        if provider_id not in self._providers:
+            raise KeyError(f"Provider '{provider_id}' not found")
+        ok = key_pool.set_key_limits(
+            provider_id, label,
+            daily_limit_tokens=daily_limit_tokens,
+            monthly_limit_tokens=monthly_limit_tokens,
+        )
+        if ok:
+            # Look up actual key value so the DB row can be created if missing
+            entry = key_pool.get_entry_by_label(provider_id, label)
+            raw_key = entry.key if entry else ""
+            await llm_config_storage.set_key_limits(
+                provider_id, label, raw_key,
+                daily_limit_tokens=daily_limit_tokens,
+                monthly_limit_tokens=monthly_limit_tokens,
+            )
+        return ok
+
+    async def reset_key_usage(
+        self, provider_id: str, label: str
+    ) -> bool:
+        """Zero out in-memory and DB usage counters for a key."""
+        if provider_id not in self._providers:
+            raise KeyError(f"Provider '{provider_id}' not found")
+        ok = key_pool.reset_key_usage_counters(provider_id, label)
+        if ok:
+            await llm_config_storage.reset_key_usage(provider_id, label)
+        return ok
+
+    # ── Provider CRUD ────────────────────────────────────────────────────────
+
+    def get_providers(self) -> list[dict]:
+        """Return providers — api_keys list is excluded (use /keys endpoint)."""
+        result = []
+        for p in self._providers.values():
+            entry = {k: v for k, v in p.items() if k != "api_keys"}
+            entry["key_count"] = key_pool.key_count(p["id"])
+            result.append(entry)
+        return result
+
+    async def add_provider(self, data: dict) -> dict:
         provider_id = data["id"].lower().strip().replace(" ", "-")
         if provider_id in self._providers:
             raise ValueError(f"Provider '{provider_id}' already exists")
+        raw_key = data.get("api_key", "")
+        keys = _keys_from_env_key(provider_id, raw_key) if raw_key else []
         entry = {
             "id": provider_id,
             "name": data.get("name", provider_id),
-            "api_key": data.get("api_key", ""),
+            "api_keys": keys,
             "base_url": data.get("base_url", ""),
-            "enabled": bool(data.get("api_key", "")),
+            "enabled": bool(keys),
             "custom": True,
             "model_prefix": data.get("model_prefix", ""),
             "description": data.get("description", ""),
-            "compatible_with": data.get("compatible_with", "openai"),  # openai|anthropic|custom
+            "compatible_with": data.get("compatible_with", "openai"),
         }
         self._providers[provider_id] = entry
-        self._apply_provider_env(provider_id)
-        return entry
+        self._sync_pool_and_env(provider_id)
+        # Persist
+        await self._persist_provider(provider_id)
+        for k in keys:
+            await self._persist_key(provider_id, k["label"], k["key"])
+        return {k: v for k, v in entry.items() if k != "api_keys"}
 
-    def update_provider(self, provider_id: str, data: dict) -> dict:
+    async def update_provider(self, provider_id: str, data: dict) -> dict:
         if provider_id not in self._providers:
             raise KeyError(f"Provider '{provider_id}' not found")
+        # If a new single api_key is supplied, treat it as a key rotation
+        raw_key = data.pop("api_key", None)
+        if raw_key:
+            p = self._providers[provider_id]
+            # Replace the "default" key if present, else add it
+            found = False
+            for k in p["api_keys"]:
+                if k["label"] == "default":
+                    k["key"] = raw_key
+                    found = True
+                    break
+            if not found:
+                p["api_keys"].insert(0, {"label": "default", "key": raw_key})
+            data["enabled"] = True
+            await self._persist_key(provider_id, "default", raw_key)
         self._providers[provider_id].update(data)
-        self._apply_provider_env(provider_id)
-        return self._providers[provider_id]
+        self._sync_pool_and_env(provider_id)
+        # Persist
+        await self._persist_provider(provider_id)
+        return {k: v for k, v in self._providers[provider_id].items() if k != "api_keys"}
 
-    def delete_provider(self, provider_id: str):
+    async def delete_provider(self, provider_id: str) -> None:
         builtin = {"openrouter", "anthropic", "openai", "google"}
         if provider_id in builtin:
             raise ValueError(f"Cannot delete built-in provider '{provider_id}'")
         if provider_id not in self._providers:
             raise KeyError(f"Provider '{provider_id}' not found")
         del self._providers[provider_id]
+        await llm_config_storage.delete_provider(provider_id)
 
-    # --- Models ---
+    # ── Models ───────────────────────────────────────────────────────────────
+
     def get_models(self) -> list[dict]:
         return list(self._models.values())
 
-    def add_model(self, data: dict) -> dict:
+    async def add_model(self, data: dict) -> dict:
         model_id = data["model_id"]
         if model_id in self._models:
             raise ValueError(f"Model '{model_id}' already exists")
@@ -193,9 +435,10 @@ class LLMConfigStore:
             "max_tokens_per_day": data.get("max_tokens_per_day", 0),
         }
         self._models[model_id] = entry
+        await self._persist_model(model_id)
         return entry
 
-    def update_model(self, model_id: str, data: dict) -> dict:
+    async def update_model(self, model_id: str, data: dict) -> dict:
         if model_id not in self._models:
             raise KeyError(f"Model '{model_id}' not found")
         self._models[model_id].update(data)
@@ -207,9 +450,10 @@ class LLMConfigStore:
             max_tokens_per_minute=m.get("max_tokens_per_minute", 0),
             max_tokens_per_day=m.get("max_tokens_per_day", 0),
         ))
+        await self._persist_model(model_id)
         return self._models[model_id]
 
-    def delete_model(self, model_id: str):
+    async def delete_model(self, model_id: str) -> None:
         if model_id not in self._models:
             raise KeyError(f"Model '{model_id}' not found")
         del self._models[model_id]
@@ -217,22 +461,23 @@ class LLMConfigStore:
         for tier in self._routing.values():
             if model_id in tier:
                 tier.remove(model_id)
+        await llm_config_storage.delete_model(model_id)
 
-    # --- Routing ---
+    # ── Routing ──────────────────────────────────────────────────────────────
+
     def get_routing(self) -> dict[str, list[str]]:
         return dict(self._routing)
 
-    def update_routing(self, routing: dict[str, list[str]]):
+    async def update_routing(self, routing: dict[str, list[str]]) -> None:
         self._routing.update(routing)
         # Rebuild the live MODEL_ROUTING used by the gateway
-        import forge_core.config as cfg
         new_routing = {}
         for complexity in TaskComplexity:
             tier_models = self._routing.get(complexity.value, [])
-            # Build LLMModel-compatible list (custom strings OK)
             new_routing[complexity] = tier_models
         # Patch gateway to use updated routing
         llm_gateway._dynamic_routing = new_routing
+        await self._persist_routing()
 
 
 _llm_config = LLMConfigStore()
@@ -244,6 +489,11 @@ async def lifespan(app: FastAPI):
     logger.info(f"FORGE v{settings.app_version} starting...")
     settings.workspace_dir.mkdir(parents=True, exist_ok=True)
     logger.info(f"Workspace directory: {settings.workspace_dir}")
+    # Init storage tables (projects + LLM config)
+    await storage.initialize()
+    await llm_config_storage.initialize()
+    # Restore LLM config saved from previous run
+    await _llm_config.load_from_db()
     await orchestrator.ensure_initialized()
     yield
     logger.info("FORGE shutting down...")
@@ -576,43 +826,38 @@ class ModelTestRequest(BaseModel):
     provider_id: Optional[str] = None
 
 
+# ── Provider key management request models ───────────────────────────────────
+
+class ProviderKeyAddRequest(BaseModel):
+    label: str
+    api_key: str
+
+
+# ── Provider endpoints ───────────────────────────────────────────────────────
+
 @app.get("/api/llm/providers")
 async def get_providers():
-    """Get all LLM providers with their key status."""
+    """Get all LLM providers."""
     providers = _llm_config.get_providers()
-    # Mask keys in response
-    safe = []
-    for p in providers:
-        entry = dict(p)
-        if entry.get("api_key"):
-            key = entry["api_key"]
-            entry["api_key_masked"] = key[:8] + "*" * (len(key) - 12) + key[-4:] if len(key) > 12 else "****"
-            entry["has_key"] = True
-        else:
-            entry["api_key_masked"] = ""
-            entry["has_key"] = False
-        # Never expose raw key
-        entry.pop("api_key", None)
-        safe.append(entry)
-    return safe
+    return providers           # api_keys list is NOT included; use /keys endpoint
 
 
 @app.post("/api/llm/providers", status_code=201)
 async def add_provider(req: ProviderCreateRequest):
     """Add a custom LLM provider."""
     try:
-        provider = _llm_config.add_provider(req.model_dump())
-        return {"message": "Provider added", "provider": {k: v for k, v in provider.items() if k != "api_key"}}
+        provider = await _llm_config.add_provider(req.model_dump())
+        return {"message": "Provider added", "provider": provider}
     except ValueError as e:
         raise HTTPException(409, str(e))
 
 
 @app.put("/api/llm/providers/{provider_id}")
 async def update_provider(provider_id: str, req: ProviderUpdateRequest):
-    """Update a provider's API key, endpoint, or enabled status."""
+    """Update a provider's metadata, primary API key, or enabled status."""
     try:
         data = req.model_dump(exclude_none=True)
-        updated = _llm_config.update_provider(provider_id, data)
+        updated = await _llm_config.update_provider(provider_id, data)
         return {"message": "Provider updated", "provider_id": provider_id, "enabled": updated.get("enabled")}
     except KeyError as e:
         raise HTTPException(404, str(e))
@@ -622,10 +867,105 @@ async def update_provider(provider_id: str, req: ProviderUpdateRequest):
 async def delete_provider(provider_id: str):
     """Delete a custom provider (built-in providers cannot be deleted)."""
     try:
-        _llm_config.delete_provider(provider_id)
+        await _llm_config.delete_provider(provider_id)
         return {"message": f"Provider '{provider_id}' deleted"}
     except ValueError as e:
         raise HTTPException(400, str(e))
+    except KeyError as e:
+        raise HTTPException(404, str(e))
+
+
+# ── Per-provider API-key endpoints ───────────────────────────────────────────
+
+@app.get("/api/llm/providers/{provider_id}/keys")
+async def get_provider_keys(provider_id: str):
+    """List all API keys for a provider (masked) with rotation status."""
+    try:
+        return _llm_config.get_provider_keys(provider_id)
+    except KeyError as e:
+        raise HTTPException(404, str(e))
+
+
+@app.post("/api/llm/providers/{provider_id}/keys", status_code=201)
+async def add_provider_key(provider_id: str, req: ProviderKeyAddRequest):
+    """Add a new API key to a provider's rotation pool."""
+    try:
+        entry = await _llm_config.add_provider_key(provider_id, req.label, req.api_key)
+        return {"message": "Key added", "key": entry}
+    except KeyError as e:
+        raise HTTPException(404, str(e))
+    except ValueError as e:
+        raise HTTPException(409, str(e))
+
+
+@app.delete("/api/llm/providers/{provider_id}/keys/{label}")
+async def delete_provider_key(provider_id: str, label: str):
+    """Remove an API key from a provider's rotation pool."""
+    try:
+        removed = await _llm_config.delete_provider_key(provider_id, label)
+        if not removed:
+            raise HTTPException(404, f"Key '{label}' not found for provider '{provider_id}'")
+        return {"message": f"Key '{label}' removed from '{provider_id}'"}
+    except KeyError as e:
+        raise HTTPException(404, str(e))
+
+
+@app.post("/api/llm/providers/{provider_id}/keys/{label}/reset")
+async def reset_provider_key(provider_id: str, label: str):
+    """Clear rate-limit cooldown on a specific API key."""
+    try:
+        ok = _llm_config.reset_provider_key(provider_id, label)
+        if not ok:
+            raise HTTPException(404, f"Key '{label}' not found for provider '{provider_id}'")
+        return {"message": f"Cooldown cleared for key '{label}' on '{provider_id}'"}
+    except KeyError as e:
+        raise HTTPException(404, str(e))
+
+
+# ── Provider endpoints ───────────────────────────────────────────────────────
+
+class KeyLimitsRequest(BaseModel):
+    daily_limit_tokens: int = 0
+    monthly_limit_tokens: int = 0
+
+
+@app.get("/api/llm/providers/{provider_id}/keys/usage")
+async def get_provider_key_usage(provider_id: str):
+    """Get per-key usage statistics including tokens used and remaining budget."""
+    try:
+        return key_pool.get_key_usage(provider_id)
+    except KeyError as e:
+        raise HTTPException(404, str(e))
+
+
+@app.put("/api/llm/providers/{provider_id}/keys/{label}/limits")
+async def set_key_limits(provider_id: str, label: str, req: KeyLimitsRequest):
+    """Set daily/monthly token budget limits on a specific API key."""
+    try:
+        ok = await _llm_config.set_key_limits(
+            provider_id, label,
+            daily_limit_tokens=req.daily_limit_tokens,
+            monthly_limit_tokens=req.monthly_limit_tokens,
+        )
+        if not ok:
+            raise HTTPException(404, f"Key '{label}' not found for provider '{provider_id}'")
+        return {
+            "message": f"Limits set for key '{label}' on '{provider_id}'",
+            "daily_limit_tokens": req.daily_limit_tokens,
+            "monthly_limit_tokens": req.monthly_limit_tokens,
+        }
+    except KeyError as e:
+        raise HTTPException(404, str(e))
+
+
+@app.post("/api/llm/providers/{provider_id}/keys/{label}/reset-usage")
+async def reset_key_usage(provider_id: str, label: str):
+    """Reset all usage counters for a specific API key to zero."""
+    try:
+        ok = await _llm_config.reset_key_usage(provider_id, label)
+        if not ok:
+            raise HTTPException(404, f"Key '{label}' not found for provider '{provider_id}'")
+        return {"message": f"Usage counters reset for key '{label}' on '{provider_id}'"}
     except KeyError as e:
         raise HTTPException(404, str(e))
 
@@ -640,7 +980,7 @@ async def get_models():
 async def add_model(req: ModelCreateRequest):
     """Add a custom LLM model."""
     try:
-        model = _llm_config.add_model(req.model_dump())
+        model = await _llm_config.add_model(req.model_dump())
         return model
     except ValueError as e:
         raise HTTPException(409, str(e))
@@ -650,7 +990,7 @@ async def add_model(req: ModelCreateRequest):
 async def update_model(model_id: str, req: ModelUpdateRequest):
     """Update an existing LLM model's settings."""
     try:
-        updated = _llm_config.update_model(model_id, req.model_dump(exclude_none=True))
+        updated = await _llm_config.update_model(model_id, req.model_dump(exclude_none=True))
         return updated
     except KeyError as e:
         raise HTTPException(404, str(e))
@@ -660,7 +1000,7 @@ async def update_model(model_id: str, req: ModelUpdateRequest):
 async def delete_model(model_id: str):
     """Delete a custom LLM model."""
     try:
-        _llm_config.delete_model(model_id)
+        await _llm_config.delete_model(model_id)
         return {"message": f"Model '{model_id}' deleted"}
     except KeyError as e:
         raise HTTPException(404, str(e))
@@ -675,7 +1015,7 @@ async def get_routing():
 @app.put("/api/llm/routing")
 async def update_routing(req: RoutingUpdateRequest):
     """Update the complexity→model routing table at runtime."""
-    _llm_config.update_routing(req.routing)
+    await _llm_config.update_routing(req.routing)
     return {"message": "Routing updated", "routing": _llm_config.get_routing()}
 
 
@@ -729,7 +1069,7 @@ async def get_all_limits():
 async def set_model_limits(model_id: str, req: ModelLimitsRequest):
     """Set rate limits for a specific model."""
     try:
-        updated = _llm_config.update_model(model_id, req.model_dump())
+        updated = await _llm_config.update_model(model_id, req.model_dump())
         return {"message": f"Limits updated for {model_id}", "model": updated}
     except KeyError as e:
         raise HTTPException(404, str(e))

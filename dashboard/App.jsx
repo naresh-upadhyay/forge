@@ -202,6 +202,50 @@ const api = {
     const r = await fetch(`${API_URL}/api/llm/providers/${encodeURIComponent(providerId)}`, { method: "DELETE" });
     return r.json();
   },
+  // Per-provider key management
+  async getProviderKeys(providerId) {
+    const r = await fetch(`${API_URL}/api/llm/providers/${encodeURIComponent(providerId)}/keys`);
+    return r.json();
+  },
+  async addProviderKey(providerId, label, apiKey) {
+    const r = await fetch(`${API_URL}/api/llm/providers/${encodeURIComponent(providerId)}/keys`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ label, api_key: apiKey }),
+    });
+    return r.json();
+  },
+  async deleteProviderKey(providerId, label) {
+    const r = await fetch(`${API_URL}/api/llm/providers/${encodeURIComponent(providerId)}/keys/${encodeURIComponent(label)}`, { method: "DELETE" });
+    return r.json();
+  },
+  async resetProviderKey(providerId, label) {
+    const r = await fetch(`${API_URL}/api/llm/providers/${encodeURIComponent(providerId)}/keys/${encodeURIComponent(label)}/reset`, { method: "POST" });
+    return r.json();
+  },
+  // Per-key usage & limits
+  async getKeyUsage(providerId) {
+    const r = await fetch(`${API_URL}/api/llm/providers/${encodeURIComponent(providerId)}/keys/usage`);
+    return r.json();
+  },
+  async setKeyLimits(providerId, label, dailyLimit, monthlyLimit) {
+    const r = await fetch(
+      `${API_URL}/api/llm/providers/${encodeURIComponent(providerId)}/keys/${encodeURIComponent(label)}/limits`,
+      {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ daily_limit_tokens: dailyLimit, monthly_limit_tokens: monthlyLimit }),
+      }
+    );
+    return r.json();
+  },
+  async resetKeyUsage(providerId, label) {
+    const r = await fetch(
+      `${API_URL}/api/llm/providers/${encodeURIComponent(providerId)}/keys/${encodeURIComponent(label)}/reset-usage`,
+      { method: "POST" }
+    );
+    return r.json();
+  },
 };
 
 // ──────────────────────────────────────────────
@@ -422,6 +466,15 @@ const LLMSettingsPage = ({ onBack }) => {
   });
   const [deletingProvider, setDeletingProvider] = useState(null);
 
+  // Multi-key management state
+  const [providerKeys, setProviderKeys] = useState({});        // { providerId: [keyStatus, ...] }
+  const [expandedKeys, setExpandedKeys] = useState({});        // { providerId: bool }
+  const [loadingKeys, setLoadingKeys] = useState({});          // { providerId: bool }
+  const [addKeyForm, setAddKeyForm] = useState({});            // { providerId: {label, key, open} }
+  const [deletingKey, setDeletingKey] = useState(null);        // { providerId, label }
+  const [keyLimitForm, setKeyLimitForm] = useState({});        // { "pid:label": {daily, monthly, open} }
+  const [savingKeyLimit, setSavingKeyLimit] = useState({});    // { "pid:label": bool }
+
   const showToast = (message, type = "success") => setToast({ message, type });
 
   const loadData = useCallback(async () => {
@@ -495,8 +548,99 @@ const LLMSettingsPage = ({ onBack }) => {
       setEditProvider(null);
       showToast("Provider updated successfully");
       loadData();
+      // Refresh keys for this provider
+      loadProviderKeys(editProvider.id);
     } catch (e) {
       showToast("Failed to update provider", "error");
+    }
+  };
+
+  // ── Provider Key Helpers ──
+  const loadProviderKeys = async (providerId) => {
+    setLoadingKeys(prev => ({ ...prev, [providerId]: true }));
+    try {
+      // Use /usage endpoint so we get full stats including remaining budget
+      const keys = await api.getKeyUsage(providerId);
+      setProviderKeys(prev => ({ ...prev, [providerId]: Array.isArray(keys) ? keys : [] }));
+    } catch {
+      setProviderKeys(prev => ({ ...prev, [providerId]: [] }));
+    } finally {
+      setLoadingKeys(prev => ({ ...prev, [providerId]: false }));
+    }
+  };
+
+  const toggleExpandKeys = async (providerId) => {
+    const next = !expandedKeys[providerId];
+    setExpandedKeys(prev => ({ ...prev, [providerId]: next }));
+    if (next && !providerKeys[providerId]) {
+      await loadProviderKeys(providerId);
+    }
+  };
+
+  const handleAddKey = async (providerId) => {
+    const form = addKeyForm[providerId] || {};
+    if (!form.label?.trim() || !form.key?.trim()) return;
+    try {
+      await api.addProviderKey(providerId, form.label.trim(), form.key.trim());
+      setAddKeyForm(prev => ({ ...prev, [providerId]: { label: "", key: "", open: false } }));
+      showToast(`Key "${form.label}" added to ${providerId}`);
+      await loadProviderKeys(providerId);
+      loadData(); // refresh key_count badge
+    } catch (e) {
+      showToast("Failed to add key", "error");
+    }
+  };
+
+  const handleDeleteKey = async () => {
+    if (!deletingKey) return;
+    try {
+      await api.deleteProviderKey(deletingKey.providerId, deletingKey.label);
+      setDeletingKey(null);
+      showToast(`Key "${deletingKey.label}" removed`);
+      await loadProviderKeys(deletingKey.providerId);
+      loadData();
+    } catch (e) {
+      showToast("Failed to delete key", "error");
+    }
+  };
+
+  const handleResetKey = async (providerId, label) => {
+    try {
+      await api.resetProviderKey(providerId, label);
+      showToast(`Cooldown cleared for key "${label}"`);
+      await loadProviderKeys(providerId);
+    } catch (e) {
+      showToast("Failed to reset key", "error");
+    }
+  };
+
+  const handleSetKeyLimits = async (providerId, label) => {
+    const key = `${providerId}:${label}`;
+    const form = keyLimitForm[key] || {};
+    setSavingKeyLimit(prev => ({ ...prev, [key]: true }));
+    try {
+      await api.setKeyLimits(
+        providerId, label,
+        parseInt(form.daily || 0, 10),
+        parseInt(form.monthly || 0, 10)
+      );
+      showToast(`Limits saved for "${label}"`);
+      setKeyLimitForm(prev => ({ ...prev, [key]: { ...prev[key], open: false } }));
+      await loadProviderKeys(providerId);
+    } catch {
+      showToast("Failed to save limits", "error");
+    } finally {
+      setSavingKeyLimit(prev => ({ ...prev, [key]: false }));
+    }
+  };
+
+  const handleResetKeyUsage = async (providerId, label) => {
+    try {
+      await api.resetKeyUsage(providerId, label);
+      showToast(`Usage counters reset for "${label}"`);
+      await loadProviderKeys(providerId);
+    } catch {
+      showToast("Failed to reset usage", "error");
     }
   };
 
@@ -671,7 +815,7 @@ const LLMSettingsPage = ({ onBack }) => {
         <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
           <SectionHeader
             title="API Providers"
-            subtitle="Set your API keys and endpoint URLs for each provider. Keys are stored in memory only."
+            subtitle="Set your API keys and endpoint URLs for each provider. All keys and limits are persisted — they survive server restarts."
             action={
               <Button id="add-provider-btn" onClick={() => setShowAddProvider(true)} style={{ padding: "7px 16px", fontSize: 12 }}>
                 + Add Custom Provider
@@ -745,8 +889,16 @@ const LLMSettingsPage = ({ onBack }) => {
           )}
 
           {/* Provider List */}
-          {providers.map(prov => (
+          {providers.map(prov => {
+            const keys = providerKeys[prov.id] || [];
+            const isExpanded = expandedKeys[prov.id];
+            const keyForm = addKeyForm[prov.id] || { label: "", key: "", open: false };
+            const hasKeys = (prov.key_count || 0) > 0;
+            const activeKeys = keys.filter(k => k.is_available);
+            const limitedKeys = keys.filter(k => !k.is_available);
+            return (
             <Card key={prov.id} style={{ padding: 0, overflow: "hidden", border: prov.custom ? `1px solid ${theme.accent}33` : undefined }}>
+              {/* ── Header row ── */}
               <div style={{ padding: "16px 20px", display: "flex", alignItems: "center", gap: 14 }}>
                 {/* Icon */}
                 <div style={{
@@ -758,10 +910,24 @@ const LLMSettingsPage = ({ onBack }) => {
                   {PROVIDER_ICONS[prov.id] || "🔌"}
                 </div>
                 <div style={{ flex: 1, minWidth: 0 }}>
-                  <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
                     <div style={{ fontSize: 15, fontWeight: 700, color: theme.text }}>{prov.name}</div>
                     {prov.custom && <span style={{ fontSize: 9, padding: "2px 7px", borderRadius: 4, background: `${theme.accent}22`, color: theme.accent, fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.5px" }}>Custom</span>}
                     {prov.compatible_with && prov.custom && <span style={{ fontSize: 9, padding: "2px 7px", borderRadius: 4, background: theme.bgHover, color: theme.textDim, fontWeight: 600 }}>{prov.compatible_with}</span>}
+                    {/* Key count badge */}
+                    <span style={{
+                      fontSize: 10, padding: "2px 8px", borderRadius: 12, fontWeight: 700,
+                      background: hasKeys ? theme.successBg : theme.errorBg,
+                      color: hasKeys ? theme.success : theme.error,
+                      border: `1px solid ${hasKeys ? theme.success : theme.error}33`,
+                    }}>
+                      🔑 {prov.key_count || 0} {prov.key_count === 1 ? "key" : "keys"}
+                    </span>
+                    {limitedKeys.length > 0 && (
+                      <span style={{ fontSize: 10, padding: "2px 8px", borderRadius: 12, fontWeight: 700, background: theme.errorBg, color: theme.error, border: `1px solid ${theme.error}33` }}>
+                        ⚠ {limitedKeys.length} rate-limited
+                      </span>
+                    )}
                   </div>
                   <div style={{ fontSize: 12, color: theme.textMuted, marginTop: 2, fontFamily: "monospace", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
                     {prov.base_url}
@@ -769,28 +935,243 @@ const LLMSettingsPage = ({ onBack }) => {
                   {prov.model_prefix && <div style={{ fontSize: 10, color: theme.textDim, marginTop: 1 }}>prefix: <span style={{ fontFamily: "monospace", color: theme.accent }}>{prov.model_prefix}/</span></div>}
                   {prov.description && <div style={{ fontSize: 11, color: theme.textDim, marginTop: 2 }}>{prov.description}</div>}
                 </div>
-                {/* Status badges */}
-                <span style={{ padding: "4px 12px", borderRadius: 20, fontSize: 11, fontWeight: 600, background: prov.has_key ? theme.successBg : theme.errorBg, color: prov.has_key ? theme.success : theme.error, border: `1px solid ${prov.has_key ? theme.success : theme.error}33` }}>
-                  {prov.has_key ? "✓ Key Set" : "No Key"}
-                </span>
-                <div style={{ padding: "4px 12px", borderRadius: 20, fontSize: 11, fontWeight: 600, background: prov.enabled ? theme.accentGlow : `${theme.textDim}22`, color: prov.enabled ? theme.accent : theme.textDim, border: `1px solid ${prov.enabled ? theme.accent : theme.textDim}33` }}>
-                  {prov.enabled ? "Enabled" : "Disabled"}
-                </div>
-                <Button variant="ghost" onClick={() => setEditProvider({ ...prov, api_key: "" })} style={{ padding: "6px 14px", fontSize: 12 }}>Edit</Button>
-                {prov.custom && (
-                  <Button variant="danger" onClick={() => setDeletingProvider(prov)} style={{ padding: "6px 12px", fontSize: 12 }}>🗑</Button>
-                )}
-              </div>
-              {/* Masked key display */}
-              {prov.has_key && (
-                <div style={{ padding: "0 20px 14px 78px" }}>
-                  <div style={{ fontFamily: "monospace", fontSize: 12, color: theme.textDim, background: theme.bgInput, padding: "6px 12px", borderRadius: 6, display: "inline-block" }}>
-                    {prov.api_key_masked}
+                {/* Action buttons */}
+                <div style={{ display: "flex", alignItems: "center", gap: 8, flexShrink: 0, flexWrap: "wrap" }}>
+                  <div style={{ padding: "4px 12px", borderRadius: 20, fontSize: 11, fontWeight: 600, background: prov.enabled ? theme.accentGlow : `${theme.textDim}22`, color: prov.enabled ? theme.accent : theme.textDim, border: `1px solid ${prov.enabled ? theme.accent : theme.textDim}33` }}>
+                    {prov.enabled ? "Enabled" : "Disabled"}
                   </div>
+                  <Button
+                    id={`keys-toggle-${prov.id}`}
+                    variant="ghost"
+                    onClick={() => toggleExpandKeys(prov.id)}
+                    style={{ padding: "6px 14px", fontSize: 12, color: isExpanded ? theme.accent : theme.textMuted }}
+                  >
+                    {isExpanded ? "▲ Keys" : "▼ Keys"}
+                  </Button>
+                  <Button variant="ghost" onClick={() => setEditProvider({ ...prov, api_key: "" })} style={{ padding: "6px 14px", fontSize: 12 }}>Edit</Button>
+                  {prov.custom && (
+                    <Button variant="danger" onClick={() => setDeletingProvider(prov)} style={{ padding: "6px 12px", fontSize: 12 }}>🗑</Button>
+                  )}
+                </div>
+              </div>
+
+              {/* ── Expanded Keys Section ── */}
+              {isExpanded && (
+                <div style={{ borderTop: `1px solid ${theme.border}`, background: theme.bg, padding: "16px 20px" }}>
+                  <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 12 }}>
+                    <div style={{ fontSize: 12, fontWeight: 700, color: theme.textMuted, textTransform: "uppercase", letterSpacing: "0.5px" }}>API Key Pool</div>
+                    <Button
+                      id={`add-key-${prov.id}`}
+                      style={{ padding: "5px 12px", fontSize: 11 }}
+                      onClick={() => setAddKeyForm(prev => ({ ...prev, [prov.id]: { ...keyForm, open: !keyForm.open } }))}
+                    >
+                      {keyForm.open ? "✕ Cancel" : "+ Add Key"}
+                    </Button>
+                  </div>
+
+                  {/* Add Key inline form */}
+                  {keyForm.open && (
+                    <div style={{ background: theme.bgCard, border: `1px solid ${theme.accent}44`, borderRadius: 10, padding: 14, marginBottom: 12, display: "grid", gridTemplateColumns: "1fr 2fr auto", gap: 10, alignItems: "flex-end" }}>
+                      <div>
+                        <Label>Label</Label>
+                        <Input
+                          id={`key-label-${prov.id}`}
+                          value={keyForm.label || ""}
+                          onChange={e => setAddKeyForm(prev => ({ ...prev, [prov.id]: { ...keyForm, label: e.target.value } }))}
+                          placeholder="key-2, backup, account-b"
+                        />
+                      </div>
+                      <div>
+                        <Label>API Key</Label>
+                        <Input
+                          id={`key-value-${prov.id}`}
+                          type="password"
+                          value={keyForm.key || ""}
+                          onChange={e => setAddKeyForm(prev => ({ ...prev, [prov.id]: { ...keyForm, key: e.target.value } }))}
+                          placeholder="sk-or-v1-..."
+                        />
+                      </div>
+                      <Button
+                        id={`save-key-${prov.id}`}
+                        onClick={() => handleAddKey(prov.id)}
+                        disabled={!keyForm.label?.trim() || !keyForm.key?.trim()}
+                        style={{ padding: "10px 18px", fontSize: 12, whiteSpace: "nowrap" }}
+                      >
+                        Save Key
+                      </Button>
+                    </div>
+                  )}
+
+                  {/* Keys list */}
+                  {loadingKeys[prov.id] ? (
+                    <div style={{ color: theme.textMuted, fontSize: 12, padding: "8px 0" }}>Loading keys…</div>
+                  ) : keys.length === 0 ? (
+                    <div style={{ color: theme.textDim, fontSize: 12, padding: "8px 0", textAlign: "center" }}>No keys configured — click "+ Add Key" to add one.</div>
+                  ) : (
+                    <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+                      {keys.map((k) => {
+                        const isRateLimited = !k.is_available;
+                        const isCurrent = k.is_current;
+                        const ttl = isRateLimited ? k.status?.split(":")[1] : null;
+                        const limitKey = `${prov.id}:${k.label}`;
+                        const lf = keyLimitForm[limitKey] || {};
+                        const hasDailyLimit = (k.daily_limit_tokens || 0) > 0;
+                        const hasMonthlyLimit = (k.monthly_limit_tokens || 0) > 0;
+                        const dailyPct = hasDailyLimit ? Math.min(100, ((k.tokens_used_today || 0) / k.daily_limit_tokens) * 100) : 0;
+                        const monthlyPct = hasMonthlyLimit ? Math.min(100, ((k.tokens_used_this_month || 0) / k.monthly_limit_tokens) * 100) : 0;
+                        const fmt = (n) => n == null ? "∞" : n >= 1_000_000 ? `${(n/1_000_000).toFixed(1)}M` : n >= 1_000 ? `${(n/1_000).toFixed(0)}K` : String(n);
+                        return (
+                          <div key={k.label} style={{
+                            background: theme.bgCard, borderRadius: 10,
+                            border: `1px solid ${isRateLimited ? theme.error + "44" : isCurrent ? theme.accent + "44" : theme.border}`,
+                            overflow: "hidden",
+                          }}>
+                            {/* ── Row 1: identity + status + actions ── */}
+                            <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "10px 14px" }}>
+                              <div style={{ width: 8, height: 8, borderRadius: "50%", flexShrink: 0, background: isRateLimited ? theme.error : isCurrent ? theme.success : theme.textDim }} />
+                              <div style={{ fontSize: 12, fontWeight: 700, color: theme.text, minWidth: 80 }}>{k.label}</div>
+                              <div style={{ fontFamily: "monospace", fontSize: 11, color: theme.textDim, flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{k.masked_key}</div>
+                              {/* Status badge */}
+                              <span style={{
+                                fontSize: 10, padding: "2px 8px", borderRadius: 12, fontWeight: 700, flexShrink: 0,
+                                background: isRateLimited ? theme.errorBg : isCurrent ? theme.successBg : `${theme.textDim}22`,
+                                color: isRateLimited ? theme.error : isCurrent ? theme.success : theme.textDim,
+                              }}>
+                                {isRateLimited ? `⏸ Rate Limited ${ttl ? `(${ttl})` : ""}` : isCurrent ? "● Active" : "◌ Standby"}
+                              </span>
+                              {/* Actions */}
+                              {isRateLimited && (
+                                <button id={`reset-key-${prov.id}-${k.label}`}
+                                  onClick={() => handleResetKey(prov.id, k.label)}
+                                  style={{ padding: "3px 10px", borderRadius: 6, fontSize: 10, fontWeight: 600, background: theme.warningBg, border: `1px solid ${theme.warning}44`, color: theme.warning, cursor: "pointer" }}>
+                                  ↺ Reset
+                                </button>
+                              )}
+                              <button
+                                onClick={() => setKeyLimitForm(prev => ({ ...prev, [limitKey]: { daily: k.daily_limit_tokens||0, monthly: k.monthly_limit_tokens||0, open: !lf.open } }))}
+                                style={{ padding: "3px 10px", borderRadius: 6, fontSize: 10, fontWeight: 600, background: theme.infoBg, border: `1px solid ${theme.info}44`, color: theme.info, cursor: "pointer" }}>
+                                ⚙ Limits
+                              </button>
+                              <button id={`del-key-${prov.id}-${k.label}`}
+                                onClick={() => setDeletingKey({ providerId: prov.id, label: k.label })}
+                                style={{ padding: "3px 8px", borderRadius: 6, fontSize: 10, fontWeight: 600, background: theme.errorBg, border: `1px solid ${theme.error}33`, color: theme.error, cursor: "pointer" }}>
+                                ✕
+                              </button>
+                            </div>
+
+                            {/* ── Row 2: usage stats ── */}
+                            <div style={{ padding: "6px 14px 10px", display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 8, borderTop: `1px solid ${theme.border}` }}>
+                              {[
+                                { label: "Calls", value: (k.total_calls||0).toLocaleString(), icon: "📞" },
+                                { label: "Tokens In", value: fmt(k.total_tokens_in||0), icon: "→" },
+                                { label: "Tokens Out", value: fmt(k.total_tokens_out||0), icon: "←" },
+                                { label: "Errors", value: (k.total_errors||0).toLocaleString(), icon: "⚠", color: (k.total_errors||0) > 0 ? theme.error : theme.textDim },
+                              ].map(stat => (
+                                <div key={stat.label} style={{ textAlign: "center" }}>
+                                  <div style={{ fontSize: 15, fontWeight: 700, color: stat.color || theme.text }}>{stat.icon} {stat.value}</div>
+                                  <div style={{ fontSize: 10, color: theme.textDim, marginTop: 1 }}>{stat.label}</div>
+                                </div>
+                              ))}
+                            </div>
+
+                            {/* ── Row 3: budget bars ── */}
+                            {(hasDailyLimit || hasMonthlyLimit) && (
+                              <div style={{ padding: "6px 14px 10px", borderTop: `1px solid ${theme.border}`, display: "flex", flexDirection: "column", gap: 6 }}>
+                                {hasDailyLimit && (
+                                  <div>
+                                    <div style={{ display: "flex", justifyContent: "space-between", fontSize: 10, color: theme.textMuted, marginBottom: 3 }}>
+                                      <span>Daily budget</span>
+                                      <span style={{ color: dailyPct > 85 ? theme.error : dailyPct > 60 ? theme.warning : theme.success }}>
+                                        {fmt(k.tokens_used_today||0)} / {fmt(k.daily_limit_tokens)} used · {fmt(k.tokens_remaining_today)} left
+                                      </span>
+                                    </div>
+                                    <div style={{ height: 5, background: theme.border, borderRadius: 4 }}>
+                                      <div style={{ height: "100%", width: `${dailyPct}%`, borderRadius: 4, transition: "width 0.4s",
+                                        background: dailyPct > 85 ? theme.error : dailyPct > 60 ? theme.warning : theme.success }} />
+                                    </div>
+                                  </div>
+                                )}
+                                {hasMonthlyLimit && (
+                                  <div>
+                                    <div style={{ display: "flex", justifyContent: "space-between", fontSize: 10, color: theme.textMuted, marginBottom: 3 }}>
+                                      <span>Monthly budget</span>
+                                      <span style={{ color: monthlyPct > 85 ? theme.error : monthlyPct > 60 ? theme.warning : theme.success }}>
+                                        {fmt(k.tokens_used_this_month||0)} / {fmt(k.monthly_limit_tokens)} used · {fmt(k.tokens_remaining_this_month)} left
+                                      </span>
+                                    </div>
+                                    <div style={{ height: 5, background: theme.border, borderRadius: 4 }}>
+                                      <div style={{ height: "100%", width: `${monthlyPct}%`, borderRadius: 4, transition: "width 0.4s",
+                                        background: monthlyPct > 85 ? theme.error : monthlyPct > 60 ? theme.warning : theme.success }} />
+                                    </div>
+                                  </div>
+                                )}
+                                <button onClick={() => handleResetKeyUsage(prov.id, k.label)}
+                                  style={{ alignSelf: "flex-end", marginTop: 2, padding: "2px 10px", borderRadius: 6, fontSize: 10, fontWeight: 600, background: "transparent", border: `1px solid ${theme.border}`, color: theme.textDim, cursor: "pointer" }}>
+                                  Reset usage counters
+                                </button>
+                              </div>
+                            )}
+
+                            {/* ── Row 4: Set Limits inline form ── */}
+                            {lf.open && (
+                              <div style={{ padding: "10px 14px", borderTop: `1px solid ${theme.accent}33`, background: theme.accentGlow, display: "grid", gridTemplateColumns: "1fr 1fr auto auto", gap: 10, alignItems: "flex-end" }}>
+                                <div>
+                                  <div style={{ fontSize: 10, color: theme.textMuted, fontWeight: 600, marginBottom: 4, textTransform: "uppercase" }}>Daily Token Limit</div>
+                                  <input type="number" min="0"
+                                    value={lf.daily ?? k.daily_limit_tokens ?? 0}
+                                    onChange={e => setKeyLimitForm(prev => ({ ...prev, [limitKey]: { ...lf, daily: e.target.value } }))}
+                                    placeholder="0 = unlimited"
+                                    style={{ width: "100%", padding: "7px 10px", background: theme.bgInput, border: `1px solid ${theme.border}`, borderRadius: 7, color: theme.text, fontSize: 13, outline: "none", boxSizing: "border-box" }}
+                                  />
+                                </div>
+                                <div>
+                                  <div style={{ fontSize: 10, color: theme.textMuted, fontWeight: 600, marginBottom: 4, textTransform: "uppercase" }}>Monthly Token Limit</div>
+                                  <input type="number" min="0"
+                                    value={lf.monthly ?? k.monthly_limit_tokens ?? 0}
+                                    onChange={e => setKeyLimitForm(prev => ({ ...prev, [limitKey]: { ...lf, monthly: e.target.value } }))}
+                                    placeholder="0 = unlimited"
+                                    style={{ width: "100%", padding: "7px 10px", background: theme.bgInput, border: `1px solid ${theme.border}`, borderRadius: 7, color: theme.text, fontSize: 13, outline: "none", boxSizing: "border-box" }}
+                                  />
+                                </div>
+                                <button onClick={() => handleSetKeyLimits(prov.id, k.label)}
+                                  disabled={savingKeyLimit[limitKey]}
+                                  style={{ padding: "9px 16px", borderRadius: 7, fontSize: 12, fontWeight: 700, background: theme.accent, color: "#fff", border: "none", cursor: "pointer" }}>
+                                  {savingKeyLimit[limitKey] ? "…" : "Save"}
+                                </button>
+                                <button onClick={() => setKeyLimitForm(prev => ({ ...prev, [limitKey]: { ...lf, open: false } }))}
+                                  style={{ padding: "9px 12px", borderRadius: 7, fontSize: 12, background: "transparent", border: `1px solid ${theme.border}`, color: theme.textMuted, cursor: "pointer" }}>
+                                  ✕
+                                </button>
+                              </div>
+                            )}
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
                 </div>
               )}
             </Card>
-          ))}
+            );
+          })}
+
+          {/* Delete Key Confirmation */}
+          {deletingKey && (
+            <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.75)", zIndex: 1000, display: "flex", alignItems: "center", justifyContent: "center", padding: 20 }}>
+              <div style={{ background: theme.bgCard, border: `1px solid ${theme.error}44`, borderRadius: 16, padding: 32, width: "100%", maxWidth: 400, textAlign: "center" }}>
+                <div style={{ fontSize: 30, marginBottom: 12 }}>🗑️</div>
+                <div style={{ fontSize: 16, fontWeight: 700, color: theme.text, marginBottom: 8 }}>Remove API Key?</div>
+                <div style={{ fontSize: 13, color: theme.textMuted, marginBottom: 24 }}>
+                  Remove key <strong style={{ color: theme.text }}>«{deletingKey.label}»</strong> from <strong style={{ color: theme.text }}>{deletingKey.providerId}</strong>?<br/>
+                  The gateway will stop using this key immediately.
+                </div>
+                <div style={{ display: "flex", gap: 10 }}>
+                  <Button variant="ghost" onClick={() => setDeletingKey(null)} style={{ flex: 1 }}>Cancel</Button>
+                  <Button variant="danger" onClick={handleDeleteKey} style={{ flex: 1 }}>Remove Key</Button>
+                </div>
+              </div>
+            </div>
+          )}
 
           {/* Edit Provider Modal */}
           {editProvider && (

@@ -6,9 +6,12 @@ based on task complexity and cost optimization.
 Failover behaviour:
   - Before each attempt the rate limiter is consulted.
   - If RPM or token budget would be exceeded → skip to next fallback immediately.
-  - If the API call itself fails → record failure, try next fallback.
-  - In both cases the FULL message history (context window) is forwarded to
-    the replacement model so it can continue exactly where the previous one left off.
+  - If the API call itself fails with a rate-limit error → the key_pool rotates
+    to the next available API key for the same provider and the same model is
+    retried (up to MAX_KEY_RETRIES times) before moving to the next model.
+  - Any other API error → record failure, try next model.
+  - In all cases the FULL message history (context window) is forwarded to the
+    replacement model so it can continue exactly where the previous one left off.
   - Failover events are recorded in the rate_limiter log.
 """
 
@@ -18,6 +21,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import os
 import time
 from collections import defaultdict
 from typing import Any, Optional
@@ -26,6 +30,29 @@ import litellm
 
 from forge_core.config import MODEL_ROUTING, LLMModel, TaskComplexity, settings
 from forge_core.llm.rate_limiter import rate_limiter
+from forge_core.llm.key_pool import key_pool
+
+
+async def _persist_key_usage(
+    provider_id: str,
+    label: str,
+    tokens_in: int,
+    tokens_out: int,
+    errors: int = 0,
+    api_key: str = "",
+) -> None:
+    """Fire-and-forget: persist key usage delta to SQLite."""
+    try:
+        from forge_core.storage import llm_config_storage
+        await llm_config_storage.update_key_usage(
+            provider_id, label,
+            api_key=api_key,
+            tokens_in=tokens_in,
+            tokens_out=tokens_out,
+            errors=errors,
+        )
+    except Exception as exc:
+        logger.debug(f"[Gateway] DB key-usage persist failed (non-critical): {exc}")
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +61,44 @@ litellm.suppress_debug_info = True
 
 # Sentinel so we can detect "no result yet" vs empty string
 _UNSET = object()
+
+# How many times to retry a model with a fresh API key before giving up on it
+MAX_KEY_RETRIES = 5
+
+# Map from litellm model-string prefix → provider_id (used by key_pool)
+_PROVIDER_BY_PREFIX: dict[str, str] = {
+    "claude":       "anthropic",
+    "anthropic":    "anthropic",
+    "gpt":          "openai",
+    "o1":           "openai",
+    "openai":       "openai",
+    "gemini":       "google",
+    "openrouter":   "openrouter",
+}
+
+
+def _provider_for_model(model: str) -> Optional[str]:
+    """Identify the key_pool provider_id for a given model string."""
+    lower = model.lower()
+    for prefix, pid in _PROVIDER_BY_PREFIX.items():
+        if lower.startswith(prefix) or f"/{prefix}" in lower:
+            return pid
+    return None
+
+
+def _apply_key_to_env(provider_id: str, api_key: str) -> None:
+    """Inject a specific API key into the environment for LiteLLM."""
+    if provider_id == "anthropic":
+        os.environ["ANTHROPIC_API_KEY"] = api_key
+    elif provider_id == "openai":
+        os.environ["OPENAI_API_KEY"] = api_key
+    elif provider_id == "google":
+        os.environ["GEMINI_API_KEY"] = api_key
+    elif provider_id == "openrouter":
+        os.environ["OPENROUTER_API_KEY"] = api_key
+    else:
+        env_prefix = provider_id.upper().replace("-", "_")
+        os.environ[f"{env_prefix}_API_KEY"] = api_key
 
 
 class LLMGateway:
@@ -48,16 +113,20 @@ class LLMGateway:
         self._configure_keys()
 
     def _configure_keys(self):
-        """Set API keys from settings into environment for LiteLLM."""
-        import os
-        if settings.anthropic_api_key:
-            os.environ["ANTHROPIC_API_KEY"] = settings.anthropic_api_key
-        if settings.openai_api_key:
-            os.environ["OPENAI_API_KEY"] = settings.openai_api_key
-        if settings.google_api_key:
-            os.environ["GEMINI_API_KEY"] = settings.google_api_key
-        if settings.open_router_key:
-            os.environ["OPENROUTER_API_KEY"] = settings.open_router_key
+        """Set API keys from key_pool (or settings fallback) into environment for LiteLLM."""
+        providers = {
+            "anthropic": ("ANTHROPIC_API_KEY",   settings.anthropic_api_key),
+            "openai":    ("OPENAI_API_KEY",       settings.openai_api_key),
+            "google":    ("GEMINI_API_KEY",       settings.google_api_key),
+            "openrouter":("OPENROUTER_API_KEY",   settings.open_router_key),
+        }
+        for provider_id, (env_var, fallback) in providers.items():
+            active = key_pool.get_active_key(provider_id)
+            if active:
+                os.environ[env_var] = active
+            elif fallback:
+                os.environ[env_var] = fallback
+
         if settings.open_base_url:
             os.environ["OPENROUTER_API_BASE"] = settings.open_base_url
 
@@ -97,7 +166,6 @@ class LLMGateway:
 
     def _is_model_available(self, model: LLMModel) -> bool:
         """Check if a model's provider has an API key configured."""
-        import os
         if "claude" in model.value or "anthropic" in model.value:
             return bool(os.environ.get("ANTHROPIC_API_KEY"))
         elif "gpt" in model.value or "o1" in model.value:
@@ -130,11 +198,13 @@ class LLMGateway:
         """
         Send a completion request to the appropriate LLM.
 
-        Failover chain:
+        Failover chain (two-level):
           1. Choose model list from routing.
-          2. For each candidate:
-             a. Check rate limits. If exceeded → record failover, skip.
-             b. Call LiteLLM API.  If error  → record failure/failover, skip.
+          2. For each candidate model:
+             a. Check rate limits. If exceeded → record failover, skip model.
+             b. Attempt up to MAX_KEY_RETRIES times, rotating API keys on 429:
+                - On RateLimitError  → key_pool rotates key, retry same model.
+                - On other error     → record failure, break inner loop.
              c. On success → record usage, return result.
           3. The full `full_messages` (context window) is forwarded to every
              candidate so no context is lost during failover.
@@ -213,90 +283,200 @@ class LLMGateway:
                 previous_model = current_model
                 continue
 
-            # ── API call ──────────────────────────────────────────
-            start = time.time()
-            try:
-                logger.info(f"[Gateway] Attempting: model={current_model}")
-                response = await litellm.acompletion(**create_kwargs(current_model))
-                elapsed = time.time() - start
+            # ── Identify provider for key rotation ───────────────
+            provider_id = _provider_for_model(current_model)
 
-                result = response.choices[0].message.content or ""
-                actual_model = getattr(response, "model", current_model)
+            # ── Inner key-rotation retry loop ─────────────────────
+            model_succeeded = False
+            for key_attempt in range(MAX_KEY_RETRIES):
+                # Ensure the active key for this provider is in env
+                if provider_id:
+                    active_key = key_pool.get_active_key(provider_id)
+                    if active_key:
+                        _apply_key_to_env(provider_id, active_key)
+                    elif key_attempt > 0:
+                        # All keys exhausted for this provider
+                        logger.warning(
+                            f"[KeyPool] {provider_id}: all keys exhausted — "
+                            f"skipping model {current_model}"
+                        )
+                        break
 
-                # Record successful usage
-                usage = response.usage
-                input_tok  = getattr(usage, "prompt_tokens",     0) or estimated_tokens
-                output_tok = getattr(usage, "completion_tokens", 0)
+                start = time.time()
+                try:
+                    logger.info(
+                        f"[Gateway] Attempting: model={current_model} "
+                        f"key_attempt={key_attempt + 1}/{MAX_KEY_RETRIES}"
+                    )
+                    response = await litellm.acompletion(**create_kwargs(current_model))
+                    elapsed = time.time() - start
 
-                rate_limiter.record_success(current_model, input_tok, output_tok, elapsed)
+                    result = response.choices[0].message.content or ""
+                    actual_model = getattr(response, "model", current_model)
 
-                # Also keep legacy _metrics
-                self._metrics[actual_model].append({
-                    "elapsed":       elapsed,
-                    "input_tokens":  input_tok,
-                    "output_tokens": output_tok,
-                    "timestamp":     time.time(),
-                })
+                    # Record successful usage
+                    usage = response.usage
+                    input_tok  = getattr(usage, "prompt_tokens",     0) or estimated_tokens
+                    output_tok = getattr(usage, "completion_tokens", 0)
 
-                logger.info(
-                    f"[Gateway] Success: model={actual_model} "
-                    f"tokens_in={input_tok} tokens_out={output_tok} "
-                    f"time={elapsed:.2f}s"
-                )
+                    rate_limiter.record_success(current_model, input_tok, output_tok, elapsed)
 
-                # Log failover if we switched models
-                if previous_model and previous_model != current_model:
-                    rate_limiter.record_failover(
-                        from_model=previous_model,
-                        to_model=current_model,
-                        reason="fallback_success",
-                        context_tokens=input_tok,
-                        task_hint=task_hint,
+                    # ── Per-key usage tracking ────────────────────────────
+                    if provider_id:
+                        used_key = os.environ.get(
+                            {
+                                "anthropic":  "ANTHROPIC_API_KEY",
+                                "openai":     "OPENAI_API_KEY",
+                                "google":     "GEMINI_API_KEY",
+                                "openrouter": "OPENROUTER_API_KEY",
+                            }.get(provider_id, ""),
+                            "",
+                        )
+                        label = key_pool.record_key_usage(
+                            provider_id, used_key, input_tok, output_tok
+                        )
+                        if label:
+                            asyncio.create_task(
+                                _persist_key_usage(
+                                    provider_id, label, input_tok, output_tok,
+                                    api_key=used_key,
+                                )
+                            )
+
+                    # Also keep legacy _metrics
+                    self._metrics[actual_model].append({
+                        "elapsed":       elapsed,
+                        "input_tokens":  input_tok,
+                        "output_tokens": output_tok,
+                        "timestamp":     time.time(),
+                    })
+
+                    logger.info(
+                        f"[Gateway] Success: model={actual_model} "
+                        f"tokens_in={input_tok} tokens_out={output_tok} "
+                        f"time={elapsed:.2f}s"
                     )
 
-                if use_cache and cache_key:
-                    self._cache[cache_key] = result
+                    # Log failover if we switched models
+                    if previous_model and previous_model != current_model:
+                        rate_limiter.record_failover(
+                            from_model=previous_model,
+                            to_model=current_model,
+                            reason="fallback_success",
+                            context_tokens=input_tok,
+                            task_hint=task_hint,
+                        )
 
-                return result
+                    if use_cache and cache_key:
+                        self._cache[cache_key] = result
 
-            except Exception as e:
-                elapsed = time.time() - start
-                last_error = e
+                    model_succeeded = True
+                    return result
 
-                # Classify error for the log
-                err_type = type(e).__name__
-                try:
-                    import litellm.exceptions as lx
-                    if isinstance(e, lx.RateLimitError):
-                        err_type = "rpm_limit"
-                    elif isinstance(e, (lx.Timeout, lx.APIConnectionError)):
-                        err_type = "timeout"
-                    elif isinstance(e, lx.ServiceUnavailableError):
-                        err_type = "unavailable"
-                except Exception:
-                    pass
+                except Exception as e:
+                    elapsed = time.time() - start
+                    last_error = e
 
-                error_msg = str(e).split('\n')[0][:120]
-                logger.warning(
-                    f"[Gateway] Failed: {current_model} after {elapsed:.2f}s. "
-                    f"Error: {error_msg}"
-                )
+                    # Classify error
+                    err_type = type(e).__name__
+                    is_rate_limit = False
+                    try:
+                        import litellm.exceptions as lx
+                        if isinstance(e, lx.RateLimitError):
+                            err_type = "rpm_limit"
+                            is_rate_limit = True
+                        elif isinstance(e, (lx.Timeout, lx.APIConnectionError)):
+                            err_type = "timeout"
+                        elif isinstance(e, lx.ServiceUnavailableError):
+                            err_type = "unavailable"
+                    except Exception:
+                        pass
 
-                rate_limiter.record_failure(current_model, err_type, estimated_tokens)
+                    # Also detect rate-limit by status code / message for providers
+                    # that don't raise litellm.RateLimitError explicitly
+                    if not is_rate_limit:
+                        err_str = str(e).lower()
+                        if "429" in err_str or "rate limit" in err_str or "quota" in err_str:
+                            is_rate_limit = True
+                            err_type = "rpm_limit"
 
-                # Record failover event if there's a next model to try
+                    error_msg = str(e).split('\n')[0][:120]
+                    logger.warning(
+                        f"[Gateway] Failed: {current_model} "
+                        f"(key_attempt {key_attempt + 1}) after {elapsed:.2f}s. "
+                        f"Error: {error_msg}"
+                    )
+
+                    if is_rate_limit and provider_id:
+                        # ── Key rotation ───────────────────────────
+                        current_key = os.environ.get(
+                            {
+                                "anthropic":  "ANTHROPIC_API_KEY",
+                                "openai":     "OPENAI_API_KEY",
+                                "google":     "GEMINI_API_KEY",
+                                "openrouter": "OPENROUTER_API_KEY",
+                            }.get(provider_id, ""),
+                            "",
+                        )
+                        # Record the error against the key that just failed
+                        err_label = key_pool.record_key_error(provider_id, current_key)
+                        if err_label:
+                            asyncio.create_task(
+                                _persist_key_usage(
+                                    provider_id, err_label, 0, 0, errors=1
+                                )
+                            )
+
+                        new_key = key_pool.mark_rate_limited(provider_id, current_key)
+                        if new_key:
+                            logger.info(
+                                f"[Gateway] Key rotated for {provider_id} — "
+                                f"retrying {current_model}"
+                            )
+                            _apply_key_to_env(provider_id, new_key)
+                            rate_limiter.record_failure(current_model, err_type, estimated_tokens)
+                            continue   # retry same model with new key
+                        else:
+                            logger.warning(
+                                f"[Gateway] {provider_id}: no more keys — "
+                                f"giving up on {current_model}"
+                            )
+                            rate_limiter.record_failure(current_model, err_type, estimated_tokens)
+                            break      # all keys exhausted → try next model
+                    else:
+                        # Non-rate-limit error — record against key and move on
+                        if provider_id:
+                            current_key = os.environ.get(
+                                {
+                                    "anthropic":  "ANTHROPIC_API_KEY",
+                                    "openai":     "OPENAI_API_KEY",
+                                    "google":     "GEMINI_API_KEY",
+                                    "openrouter": "OPENROUTER_API_KEY",
+                                }.get(provider_id, ""),
+                                "",
+                            )
+                            err_label = key_pool.record_key_error(provider_id, current_key)
+                            if err_label:
+                                asyncio.create_task(
+                                    _persist_key_usage(
+                                        provider_id, err_label, 0, 0, errors=1
+                                    )
+                                )
+                        rate_limiter.record_failure(current_model, err_type, estimated_tokens)
+                        break
+
+            if not model_succeeded:
+                # Record failover to next model (if one exists)
                 next_idx = models_to_try.index(current_model) + 1
                 if next_idx < len(models_to_try):
                     rate_limiter.record_failover(
                         from_model=current_model,
                         to_model=models_to_try[next_idx],
-                        reason=err_type,
+                        reason=err_type if 'err_type' in dir() else "error",
                         context_tokens=estimated_tokens,
                         task_hint=task_hint,
                     )
-
                 previous_model = current_model
-                continue   # Try next model with the SAME full_messages
 
         # All models exhausted
         logger.error(f"[Gateway] All models failed. Last error: {last_error}")
