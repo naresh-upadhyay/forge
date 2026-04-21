@@ -255,6 +255,7 @@ class LLMGateway:
                 "messages": full_messages,   # ← same context for every fallback
                 "temperature": temp,
                 "max_tokens": tokens,
+                "timeout": 120,
             }
             if json_mode:
                 k["response_format"] = {"type": "json_object"}
@@ -262,6 +263,7 @@ class LLMGateway:
 
         last_error: Optional[Exception] = None
         previous_model: Optional[str] = None
+
 
         for current_model in models_to_try:
 

@@ -267,6 +267,10 @@ const api = {
     );
     return r.json();
   },
+  async getLogs(id) {
+    const r = await fetch(`${API_URL}/api/projects/${id}/logs`);
+    return r.json();
+  },
 };
 
 // ──────────────────────────────────────────────
@@ -2290,68 +2294,99 @@ const ProjectDetailPage = ({ projectId, onBack }) => {
   const [tab, setTab] = useState("live");
   const [feedback, setFeedback] = useState("");
   const [feedbackSending, setFeedbackSending] = useState(false);
+  const [feedbackError, setFeedbackError] = useState("");
   const eventsEndRef = useRef(null);
   const wsRef = useRef(null);
+  // Tracks event IDs we've already shown to prevent duplicates on reconnect
+  const seenEventIds = useRef(new Set());
 
-  // Polling + WebSocket
+  // ── Helpers ──────────────────────────────────────────────────────────────
+  const addEvents = useCallback((incoming) => {
+    if (!Array.isArray(incoming)) return;
+    setEvents((prev) => {
+      const next = [...prev];
+      for (const ev of incoming) {
+        if (ev && ev.id && !seenEventIds.current.has(ev.id)) {
+          seenEventIds.current.add(ev.id);
+          next.push(ev);
+        }
+      }
+      return next;
+    });
+  }, []);
+
+  // ── Polling + WebSocket ───────────────────────────────────────────────────
   useEffect(() => {
+    let cancelled = false;
+
     const fetchData = async () => {
       try {
         const p = await api.getProject(projectId);
-        setProject(p);
-        // Always try to fetch files (disk-backed now works even after restart)
+        if (!cancelled) setProject(p);
         try {
           const f = await api.getFiles(projectId);
-          // Guard: only use .files if it's a plain object, otherwise keep empty
-          if (f && typeof f.files === "object" && f.files !== null && !Array.isArray(f.files)) {
+          if (!cancelled && f && typeof f.files === "object" && f.files !== null && !Array.isArray(f.files)) {
             setFiles(f.files);
-          } else {
-            setFiles({});
           }
-        } catch {
-          setFiles({});
-        }
+        } catch {}
         try {
           const wu = await api.getWorkUnits(projectId);
-          setWorkUnits(wu);
+          if (!cancelled) setWorkUnits(Array.isArray(wu) ? wu : []);
         } catch {}
       } catch (e) {
         console.error(e);
       }
     };
 
+    // Seed event history from DB-backed logs endpoint (survives server restarts)
+    const seedEvents = async () => {
+      try {
+        const evts = await api.getLogs(projectId);
+        if (!cancelled && Array.isArray(evts)) addEvents(evts);
+      } catch {}
+    };
+
     fetchData();
+    seedEvents();
     const interval = setInterval(fetchData, 3000);
 
-    // WebSocket for events
+    // WebSocket for live events
+    let evtPollInterval = null;
     try {
       const wsBase = API_URL || `${window.location.protocol === "https:" ? "wss" : "ws"}://${window.location.host}`;
       const wsUrl = wsBase.replace(/^http/, "ws");
       const ws = new WebSocket(`${wsUrl}/ws/projects/${projectId}`);
       ws.onmessage = (e) => {
         const event = JSON.parse(e.data);
-        if (event.type !== "ping") {
-          setEvents((prev) => [...prev, event]);
-        }
+        if (event.type !== "ping") addEvents([event]);
       };
       ws.onerror = () => {
-        const pollEvents = async () => {
+        // WebSocket failed — fall back to polling events endpoint
+        evtPollInterval = setInterval(async () => {
           try {
             const evts = await api.getEvents(projectId);
-            setEvents(evts);
+            if (!cancelled && Array.isArray(evts)) addEvents(evts);
           } catch {}
-        };
-        const evtInterval = setInterval(pollEvents, 2000);
-        return () => clearInterval(evtInterval);
+        }, 2000);
+      };
+      ws.onclose = () => {
+        // Attempt one final REST fetch on disconnect
+        if (!cancelled) {
+          api.getEvents(projectId).then((evts) => {
+            if (!cancelled && Array.isArray(evts)) addEvents(evts);
+          }).catch(() => {});
+        }
       };
       wsRef.current = ws;
     } catch {}
 
     return () => {
+      cancelled = true;
       clearInterval(interval);
+      if (evtPollInterval) clearInterval(evtPollInterval);
       wsRef.current?.close();
     };
-  }, [projectId]);
+  }, [projectId, addEvents]);
 
   useEffect(() => {
     if (tab === "live" && events.length > 1) {
@@ -2362,15 +2397,27 @@ const ProjectDetailPage = ({ projectId, onBack }) => {
   const handleFeedback = async () => {
     if (!feedback.trim()) return;
     setFeedbackSending(true);
+    setFeedbackError("");
     try {
-      await api.submitFeedback(projectId, feedback);
-      setFeedback("");
+      const res = await api.submitFeedback(projectId, feedback);
+      if (res && res.detail) {
+        setFeedbackError(res.detail);
+      } else {
+        setFeedback("");
+        // Refresh project to show updated feedback_history
+        try {
+          const p = await api.getProject(projectId);
+          setProject(p);
+        } catch {}
+      }
     } catch (e) {
+      setFeedbackError(e.message || "Failed to submit feedback");
       console.error(e);
     } finally {
       setFeedbackSending(false);
     }
   };
+
 
   if (!project) {
     return (
@@ -2599,6 +2646,11 @@ const ProjectDetailPage = ({ projectId, onBack }) => {
           <Button onClick={handleFeedback} disabled={!feedback.trim() || feedbackSending}>
             {feedbackSending ? "Submitting..." : "Submit Feedback"}
           </Button>
+          {feedbackError && (
+            <div style={{ marginTop: 10, padding: "8px 12px", borderRadius: 8, background: theme.errorBg, color: theme.error, fontSize: 13, border: `1px solid ${theme.error}33` }}>
+              ⚠ {feedbackError}
+            </div>
+          )}
           {project.feedback_history?.length > 0 && (
             <div style={{ marginTop: 20 }}>
               <div style={{ fontSize: 12, fontWeight: 600, color: theme.textMuted, marginBottom: 8, textTransform: "uppercase", letterSpacing: "0.5px" }}>
@@ -2614,6 +2666,7 @@ const ProjectDetailPage = ({ projectId, onBack }) => {
               ))}
             </div>
           )}
+
         </Card>
       )}
     </div>

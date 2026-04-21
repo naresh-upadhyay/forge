@@ -102,6 +102,10 @@ class MasterArchitect:
             project.total_work_units = len(work_units)
             project.total_waves = max(wu.wave for wu in work_units) + 1 if work_units else 0
 
+            # ── Persist work units immediately so they survive any crash ──
+            from forge_core.storage import storage
+            await storage.save_project(project)
+
             await event_bus.emit(
                 project.id, "info",
                 f"Plan complete: {len(work_units)} work units across {project.total_waves} waves",
@@ -161,6 +165,10 @@ class MasterArchitect:
 
                 # Execute wave (with controlled parallelism)
                 await self._execute_wave(wave_units, project, workspace)
+
+                # ── Checkpoint: persist progress after every wave ──
+                from forge_core.storage import storage
+                await storage.save_project(project)
 
             # ── PHASE 4: Integration Check ──
             # (skip if no files were generated)
@@ -466,6 +474,14 @@ Return the JSON plan."""
             work_unit.status = WorkUnitStatus.FAILED
 
         workspace.delete_branch(branch_name)
+
+        # ── Checkpoint: persist this unit's final status immediately ──
+        try:
+            from forge_core.storage import storage
+            await storage.save_project(project)
+        except Exception as _exc:
+            logger.warning(f"Failed to checkpoint project after unit '{work_unit.title}': {_exc}")
+
 
     async def _fix_integration_issues(
         self,

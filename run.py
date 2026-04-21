@@ -244,7 +244,7 @@ def cmd_serve():
         f"  URL: http://{settings.api_host}:{settings.api_port}\n"
         f"  Docs: http://localhost:{settings.api_port}/docs\n\n"
         f"  [dim]Press Ctrl+C to stop[/]",
-        title="⚒  FORGE Server",
+        title="FORGE Server",
         border_style="bright_magenta",
     ))
     uvicorn.run(
@@ -252,6 +252,7 @@ def cmd_serve():
         host=settings.api_host,
         port=settings.api_port,
         reload=settings.debug,
+        reload_excludes=["*.db", "*.db-journal", "workspace/*", ".gemini/*", "dashboard/*"],
     )
 
 

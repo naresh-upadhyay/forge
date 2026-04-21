@@ -67,6 +67,11 @@ class ProjectOrchestrator:
                         agent=AgentRole.ARCHITECT,
                     )
                     logger.warning(f"Recovered stale build for project {p.id} ({p.name})")
+                # Restore event history from DB into the in-memory event bus
+                db_events = await storage.get_build_events(p.id)
+                if db_events:
+                    event_bus._event_history[p.id] = db_events
+                    logger.info(f"Restored {len(db_events)} events for project {p.id} from DB")
             self._initialized = True
             logger.info(f"Orchestrator loaded {len(self.projects)} projects from storage")
 
@@ -153,6 +158,9 @@ class ProjectOrchestrator:
         project.input_files = list(html_files.keys())
         project.input_mockups = html_files
         self._build_controls[project_id] = "running"
+        # Clear old build logs so the live feed starts fresh
+        await storage.clear_build_events(project_id)
+        event_bus.clear_history(project_id)
         await storage.save_project(project)
 
         await event_bus.emit(
@@ -189,6 +197,11 @@ class ProjectOrchestrator:
         project.input_type = "requirements"
         project.input_text = requirements_text
         self._build_controls[project_id] = "running"
+        # Clear old build logs so the live feed starts fresh
+        await storage.clear_build_events(project_id)
+        event_bus.clear_history(project_id)
+        # Persist requirements immediately so they survive a crash
+        await storage.save_project(project)
 
         await event_bus.emit(
             project.id, "status_change",

@@ -635,8 +635,15 @@ async def get_single_file(project_id: str, filepath: str):
 
 @app.get("/api/projects/{project_id}/events")
 async def get_project_events(project_id: str):
-    """Get build event history for a project."""
-    events = event_bus.get_history(project_id)
+    """Get build event history for a project (in-memory + DB fallback)."""
+    events = await event_bus.get_history_with_db_fallback(project_id)
+    return [e.model_dump(mode="json") for e in events]
+
+
+@app.get("/api/projects/{project_id}/logs")
+async def get_project_logs(project_id: str):
+    """Get build logs directly from DB (always persistent, unaffected by server restarts)."""
+    events = await storage.get_build_events(project_id)
     return [e.model_dump(mode="json") for e in events]
 
 
@@ -1144,15 +1151,20 @@ async def websocket_project_events(websocket: WebSocket, project_id: str):
     queue = event_bus.get_queue(project_id)
 
     try:
-        # Send event history first
-        for event in event_bus.get_history(project_id):
+        # Send persisted event history first (survives server restart / page refresh)
+        history = await event_bus.get_history_with_db_fallback(project_id)
+        seen_ids: set[str] = set()
+        for event in history:
             await websocket.send_json(event.model_dump(mode="json"))
+            seen_ids.add(event.id)
 
-        # Stream new events
+        # Stream new events; deduplicate against already-sent history
         while True:
             try:
                 event = await asyncio.wait_for(queue.get(), timeout=30.0)
-                await websocket.send_json(event.model_dump(mode="json"))
+                if event.id not in seen_ids:
+                    await websocket.send_json(event.model_dump(mode="json"))
+                    seen_ids.add(event.id)
             except asyncio.TimeoutError:
                 # Send keepalive
                 await websocket.send_json({"type": "ping"})
@@ -1160,6 +1172,9 @@ async def websocket_project_events(websocket: WebSocket, project_id: str):
         logger.info(f"WebSocket disconnected for project {project_id}")
     except Exception as e:
         logger.error(f"WebSocket error: {e}")
+    finally:
+        # Don't keep stale queues alive — caller can reconnect and get a fresh queue
+        pass
 
 
 # ──────────────────────────────────────────────
@@ -1217,4 +1232,5 @@ if __name__ == "__main__":
         host=settings.api_host,
         port=settings.api_port,
         reload=settings.debug,
+        reload_excludes=["*.db", "*.db-journal", "workspace/*", ".gemini/*", "dashboard/*"],
     )

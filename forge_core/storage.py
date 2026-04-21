@@ -3,12 +3,13 @@
 import json
 import logging
 import time
+import asyncio
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import aiosqlite
 from forge_core.config import settings
-from forge_core.models import Project
+from forge_core.models import Project, BuildEvent
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +28,12 @@ class StorageManager:
         else:
             # Parse from sqlite+aiosqlite:///./forge.db
             self.db_path = db_path.split(":///")[-1]
+        self._locks: Dict[str, asyncio.Lock] = {}
+
+    def _get_lock(self, project_id: str) -> asyncio.Lock:
+        if project_id not in self._locks:
+            self._locks[project_id] = asyncio.Lock()
+        return self._locks[project_id]
 
     async def initialize(self):
         """Initialize the database tables."""
@@ -41,18 +48,34 @@ class StorageManager:
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS build_logs (
+                    id TEXT PRIMARY KEY,
+                    project_id TEXT NOT NULL,
+                    event_type TEXT NOT NULL,
+                    agent TEXT,
+                    work_unit_id TEXT,
+                    message TEXT NOT NULL,
+                    data TEXT DEFAULT '{}',
+                    timestamp REAL NOT NULL
+                )
+            """)
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_build_logs_project ON build_logs(project_id, timestamp)"
+            )
             await db.commit()
             logger.info(f"Storage initialized at {self.db_path}")
 
     async def save_project(self, project: Project):
-        """Save or update a project in the database."""
-        async with aiosqlite.connect(self.db_path) as db:
-            project_json = project.model_dump_json()
-            await db.execute(
-                "INSERT OR REPLACE INTO projects (id, name, status, data, updated_at) VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)",
-                (project.id, project.name, project.status.value, project_json)
-            )
-            await db.commit()
+        """Save or update a project in the database (locked per project to prevent races)."""
+        async with self._get_lock(project.id):
+            async with aiosqlite.connect(self.db_path) as db:
+                project_json = project.model_dump_json()
+                await db.execute(
+                    "INSERT OR REPLACE INTO projects (id, name, status, data, updated_at) VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)",
+                    (project.id, project.name, project.status.value, project_json)
+                )
+                await db.commit()
 
     async def get_project(self, project_id: str) -> Optional[Project]:
         """Load a project from the database."""
@@ -71,10 +94,82 @@ class StorageManager:
                 return [Project.model_validate_json(row[0]) for row in rows]
 
     async def delete_project(self, project_id: str):
-        """Delete a project from the database."""
+        """Delete a project and its build logs from the database."""
         async with aiosqlite.connect(self.db_path) as db:
             await db.execute("DELETE FROM projects WHERE id = ?", (project_id,))
+            await db.execute("DELETE FROM build_logs WHERE project_id = ?", (project_id,))
             await db.commit()
+        # Clean up per-project lock
+        self._locks.pop(project_id, None)
+
+    # ── Build Event Log ───────────────────────────────────────────────────────
+
+    async def save_build_event(self, event) -> None:
+        """Persist a BuildEvent to the build_logs table."""
+        try:
+            async with aiosqlite.connect(self.db_path) as db:
+                await db.execute(
+                    """INSERT OR IGNORE INTO build_logs
+                       (id, project_id, event_type, agent, work_unit_id, message, data, timestamp)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        event.id,
+                        event.project_id,
+                        event.event_type,
+                        event.agent.value if event.agent else None,
+                        event.work_unit_id,
+                        event.message,
+                        json.dumps(event.data),
+                        event.timestamp.timestamp(),
+                    ),
+                )
+                await db.commit()
+        except Exception as exc:
+            logger.warning(f"[storage] Failed to persist build event: {exc}")
+
+    async def get_build_events(self, project_id: str) -> list:
+        """Load all persisted build events for a project, ordered by timestamp."""
+        from forge_core.models import AgentRole
+        from datetime import datetime, timezone
+        events: list = []
+        try:
+            async with aiosqlite.connect(self.db_path) as db:
+                async with db.execute(
+                    "SELECT id, project_id, event_type, agent, work_unit_id, message, data, timestamp "
+                    "FROM build_logs WHERE project_id = ? ORDER BY timestamp ASC",
+                    (project_id,),
+                ) as cur:
+                    rows = await cur.fetchall()
+            for row in rows:
+                eid, pid, etype, agent_str, wu_id, msg, data_str, ts = row
+                agent = None
+                if agent_str:
+                    try:
+                        agent = AgentRole(agent_str)
+                    except ValueError:
+                        pass
+                events.append(BuildEvent(
+                    id=eid,
+                    project_id=pid,
+                    event_type=etype,
+                    agent=agent,
+                    work_unit_id=wu_id,
+                    message=msg,
+                    data=json.loads(data_str or "{}"),
+                    timestamp=datetime.fromtimestamp(ts, tz=timezone.utc).replace(tzinfo=None),
+                ))
+        except Exception as exc:
+            logger.warning(f"[storage] Failed to load build events: {exc}")
+        return events
+
+    async def clear_build_events(self, project_id: str) -> None:
+        """Remove all build log entries for a project (e.g., before a rebuild)."""
+        try:
+            async with aiosqlite.connect(self.db_path) as db:
+                await db.execute("DELETE FROM build_logs WHERE project_id = ?", (project_id,))
+                await db.commit()
+        except Exception as exc:
+            logger.warning(f"[storage] Failed to clear build events: {exc}")
 
 
 # Singleton instance

@@ -94,7 +94,7 @@ class EntityField(BaseModel):
     required: bool = True
     default: Optional[str] = None
     description: str = ""
-    constraints: list[str] = Field(default_factory=list)
+    constraints: list[Any] = Field(default_factory=list)
     is_primary_key: bool = False
     is_foreign_key: bool = False
     references: Optional[str] = None  # "EntityName.field"
@@ -104,7 +104,7 @@ class Entity(BaseModel):
     name: str
     description: str = ""
     fields: list[EntityField] = Field(default_factory=list)
-    relationships: list[str] = Field(default_factory=list)
+    relationships: list[Any] = Field(default_factory=list)
 
 
 class UIComponent(BaseModel):
@@ -114,7 +114,7 @@ class UIComponent(BaseModel):
     properties: dict[str, Any] = Field(default_factory=dict)
     styles: dict[str, str] = Field(default_factory=dict)
     children: list[UIComponent] = Field(default_factory=list)
-    events: list[str] = Field(default_factory=list)
+    events: list[Any] = Field(default_factory=list)
 
 
 class Screen(BaseModel):
@@ -123,15 +123,15 @@ class Screen(BaseModel):
     route: str = ""
     description: str = ""
     components: list[UIComponent] = Field(default_factory=list)
-    data_bindings: list[str] = Field(default_factory=list)
-    api_calls: list[str] = Field(default_factory=list)
+    data_bindings: list[Any] = Field(default_factory=list)
+    api_calls: list[Any] = Field(default_factory=list)
     source_file: Optional[str] = None  # original mockup file
 
 
 class UserFlow(BaseModel):
     name: str
     description: str = ""
-    steps: list[str] = Field(default_factory=list)  # screen IDs in order
+    steps: list[Any] = Field(default_factory=list)  # screen IDs in order
     trigger: str = ""
 
 
@@ -167,6 +167,19 @@ class Blueprint(BaseModel):
     business_rules: list[BusinessRule] = Field(default_factory=list)
     design_tokens: dict[str, Any] = Field(default_factory=dict)
     constraints: dict[str, Any] = Field(default_factory=dict)
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+
+
+# ──────────────────────────────────────────────
+# Feedback
+# ──────────────────────────────────────────────
+
+class FeedbackItem(BaseModel):
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    type: FeedbackType = FeedbackType.GENERAL
+    screen_id: Optional[str] = None
+    description: str
+    resolved: bool = False
     created_at: datetime = Field(default_factory=datetime.utcnow)
 
 
@@ -252,13 +265,7 @@ class Project(BaseModel):
         return (self.completed_work_units / self.total_work_units) * 100
 
 
-class FeedbackItem(BaseModel):
-    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
-    type: FeedbackType = FeedbackType.GENERAL
-    screen_id: Optional[str] = None
-    description: str
-    resolved: bool = False
-    created_at: datetime = Field(default_factory=datetime.utcnow)
+# FeedbackItem is defined above Project (before Work Units) to avoid forward-reference errors.
 
 
 # ──────────────────────────────────────────────
